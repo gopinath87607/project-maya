@@ -651,7 +651,11 @@ bool Glm5Model::prefill_setup(std::string& err) {
     }
     int64_t per = std::min<int64_t>(g.n_expert, (int64_t) (avail / std::max<size_t>(1, blob_sum)));
     while (per > 0 && (size_t) per * stride_sum > avail) --per;
-    const int64_t keep = g.n_exp_used + gf::kSpares + 2;
+    const int64_t keep = Glm5Model::pool_keep(g.n_exp_used);
+    if (getenv("STRATA_GLM_PREFILL_KEEP") != nullptr)
+        std::fprintf(stderr, "glm prefill: CUDA%d the pool keeps %lld slots a layer while a prompt runs "
+                             "(STRATA_GLM_PREFILL_KEEP; the floor is %d, Strata's is %d)\n",
+                     dev_, (long long) keep, g.n_exp_used + gf::kSpares, g.n_exp_used + gf::kSpares + 2);
     const char* pct_env = getenv("STRATA_PREFILL_LEND_PCT");
     const char* mb_env = getenv("STRATA_GLM_PREFILL_MB");
     const size_t gbuf = has_moe ? (size_t) PrefillState::NG * PrefillState::GE * gstride : 0;
