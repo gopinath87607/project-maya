@@ -453,6 +453,9 @@ struct Glm5Model::PrefillState {
     uint64_t ct_vram = 0, ct_ram = 0, ct_disk = 0, ct_res = 0, ct_res_r = 0, ct_staged = 0, ct_pre = 0;
     uint64_t ct_cpu_e = 0, ct_cpu_r = 0;
     double ct_plan = 0, ct_disk_ms = 0, ct_cpu_ms = 0, ct_pre_ms = 0, ct_hop_in = 0;
+    double ct_feed = 0;                            // the step's wait for its rows at the hop: a part whose step covers
+                                                   // two of the sender's chunks waits twice, and wall (inside
+                                                   // prefill_half) starts after the last of them landed
     // per prompt (prefill_run resets them, its summary line reads them): each part's chunk walls and hop-ins
     double pr_wall = 0, pr_hop = 0;
     // one stage event, created on demand and reused chunk to chunk (a create that fails leaves it null: the sums then
@@ -2961,21 +2964,21 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                       "(%.1f GB/s), ring wait %.0f, gaps %.0f, mixer windows %.0f | lead %.0f, tail %.0f | pcie %.2f GB "
                       "(ram %.2f, disk %.2f) + %.2f GB vram | experts: staged %llu, resident %llu (%llu rows), "
                       "prestaged %llu, cpu %llu (%llu rows, %.0f ms) | plan %.0f ms host, disk wait %.0f ms, hop in "
-                      "%.0f ms | layer lane %.1f/%.1f ms max/min%s\n",
+                      "%.0f ms, feed %.0f ms | layer lane %.1f/%.1f ms max/min%s\n",
                       dev_, S->chunk_i, S->chunk_n, T, wall, lane, busy,
                       busy > 1.0 ? moved / (busy / 1000.0) : 0.0, wait, inner, windows, lead, tail, moved,
                       (double) S->ct_ram / gb, (double) S->ct_disk / gb, (double) S->ct_vram / gb,
                       (unsigned long long) S->ct_staged, (unsigned long long) S->ct_res,
                       (unsigned long long) S->ct_res_r, (unsigned long long) S->ct_pre,
                       (unsigned long long) S->ct_cpu_e, (unsigned long long) S->ct_cpu_r, S->ct_cpu_ms, S->ct_plan,
-                      S->ct_disk_ms, S->ct_hop_in, lmax, lmin < 1e30 ? lmin : 0.0,
+                      S->ct_disk_ms, S->ct_hop_in, S->ct_feed, lmax, lmin < 1e30 ? lmin : 0.0,
                       S->sev_layer.empty() ? " (no staged groups)" : "");
         std::fprintf(stderr, "%s", line);
         S->pr_wall += std::max(0.0, wall);
         S->pr_hop += S->ct_hop_in;
         S->ct_vram = S->ct_ram = S->ct_disk = S->ct_res = S->ct_res_r = S->ct_staged = S->ct_pre = 0;
         S->ct_cpu_e = S->ct_cpu_r = 0;
-        S->ct_plan = S->ct_disk_ms = S->ct_cpu_ms = S->ct_pre_ms = S->ct_hop_in = 0;
+        S->ct_plan = S->ct_disk_ms = S->ct_cpu_ms = S->ct_pre_ms = S->ct_hop_in = S->ct_feed = 0;
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -3024,19 +3027,30 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if ((int64_t) tokens.size() < min_n) return false;
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
-    // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
-    int Tmax = pf_->T;
-    for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tmax = std::min(Tmax, m->pf_->T);
-    const int64_t nn = (int64_t) tokens.size(), nchunks = (nn + Tmax - 1) / Tmax;
+    // longer than the head's chunk is cut into EQUAL chunks - the head's grid.  With STRATA_GLM_PREFILL_NEST=1 each
+    // later part's step is a whole number of the step of the part feeding it (load_pack_split reconciled each part's
+    // chunk to a multiple of its sender's), so a part with a bigger pool reads the same rows in fewer, longer steps:
+    // the hop copies the sender's chunks into it one at a time.  A single head chunk has nothing to nest (every part
+    // reads the whole prompt) and goes to every part as it is.  Without the knob - and under STRATA_GLM_PREFILL_SERIAL
+    // - load_pack_split left every part at the smallest part's chunk, so this same arithmetic gives them all the grid
+    // (the multiple is 1) and the equal-chunk behavior needs no second test here.
+    const int T0 = pf_->T;
+    const int64_t nn = (int64_t) tokens.size(), nchunks = (nn + T0 - 1) / T0;
     // one GPU has no pipeline to balance: full chunks and the remainder last - every chunk stages nearly every expert,
     // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s)
-    const int Trun = split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
-                                            : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
+    const int Trun = split_next_ == nullptr ? (int) std::min<int64_t>(T0, (nn + 63) / 64 * 64)
+                                            : (int) std::min<int64_t>(T0, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
+    int step = Trun, send_chunk = T0;   // the sender's step (the head's grid to start) and the sender's own chunk
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (nchunks > 1 && m != this) {
+            const int own = m->prefill_chunk(), send_step = step;   // (own: never above its own - the cap holds it)
+            step = (int) std::min<int64_t>((int64_t) own, (int64_t) std::max<int>(1, own / send_chunk) * send_step);
+            send_chunk = own;
+        }
         cudaSetDevice(m->dev_);
-        m->prefill_carve(Trun, pos_ + nn);
+        m->prefill_carve(step, pos_ + nn);
         if (!m->prefill_lend(err)) { ok = false; break; }
     }
     // STRATA_GLM_STALL_TEST=<s> (a test of the serve watchdog): every batched prompt stops here for s seconds
@@ -3083,21 +3097,21 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     const auto t0 = std::chrono::steady_clock::now();
     const int E = g.n_embd;
     const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, E);
-    int Tc = pf_->T_bound;
-    for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tc = std::min(Tc, m->pf_->T_bound);
+    // the head's step is the pipeline's grid: every later part's step (its own T_bound) is a whole number of it, and
+    // runs the rows of that many head chunks at once (the hop below copies them in one at a time)
+    const int Tc = pf_->T_bound;
     const int64_t pos_start = pos_;
     const int nc = (int) ((n + Tc - 1) / Tc);
     const auto chunk_len = [&](int c) { return (int) std::min<int64_t>(Tc, n - (int64_t) c * Tc); };
-    // the token after every position of chunk c (the draft block's caches read it): the prompt's own next token,
-    // the caller's for the last position (-1: unknown - that position is filled by the first draft of the decode);
-    // img: the image row standing for that token where it is an <|image|> (empty without images)
-    const auto next_of = [&](int c, std::vector<int32_t>& out, std::vector<const float*>& img) {
-        const int T = chunk_len(c);
+    // the token after every position of a step of T rows starting at r0 (the draft block's caches read it): the
+    // prompt's own next token, the caller's for the last position (-1: unknown - that position is filled by the first
+    // draft of the decode); img: the image row standing for that token where it is an <|image|> (empty without images)
+    const auto next_of = [&](int64_t r0, int T, std::vector<int32_t>& out, std::vector<const float*>& img) {
         out.resize((size_t) T);
         img.clear();
         if (!img_pos_.empty()) img.assign((size_t) T, nullptr);
         for (int t = 0; t < T; ++t) {
-            const int64_t j = (int64_t) c * Tc + t + 1;
+            const int64_t j = r0 + t + 1;
             out[(size_t) t] = j < n ? tokens[(size_t) j] : prefill_next_;
             if (!img.empty() && j < n) img[(size_t) t] = image_row(pos_start + j);
         }
@@ -3136,7 +3150,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             if (!embed(c)) return false;
             std::vector<int32_t> nx0;
             std::vector<const float*> im0;
-            if (mtp_il_ >= 0) next_of(c, nx0, im0);   // a single device carries the draft block itself
+            if (mtp_il_ >= 0) next_of((int64_t) c * Tc, T, nx0, im0);   // a single device carries the draft block itself
+            pf_->ct_feed = 0;   // (no hop in: this part's rows are the prompt's own)
             pf_->chunk_i = c + 1;
             pf_->chunk_n = nc;
             if (!prefill_half(p0, T, err, nx0.empty() ? nullptr : nx0.data(), im0.empty() ? nullptr : im0.data()))
@@ -3157,7 +3172,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 m->pos_ = p0;
                 std::vector<int32_t> nx;
                 std::vector<const float*> im;
-                if (m->mtp_il_ >= 0) next_of(c, nx, im);
+                if (m->mtp_il_ >= 0) next_of((int64_t) c * Tc, T, nx, im);
+                m->pf_->ct_feed = 0;   // (the serial path hands the rows over inside this thread: nothing to wait for)
                 m->pf_->chunk_i = c + 1;
                 m->pf_->chunk_n = nc;
                 if (!m->prefill_half(p0, T, err, nx.empty() ? nullptr : nx.data(), im.empty() ? nullptr : im.data()))
@@ -3173,31 +3189,42 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             }
         }
     } else {
-        // THE PIPELINE: part k reads chunk c while part k - 1 reads chunk c + 1 - the residual rows cross each
+        // THE PIPELINE: part k reads its step while part k - 1 reads the next one - the residual rows cross each
         // boundary through the earlier part's two pinned host slots (slot c & 1 is free again once the next part has
-        // copied chunk c - 2 in).  This thread runs the first part, one thread each the later ones.
+        // copied chunk c - 2 in).  A step is a whole number of the sender's chunks (its T_bound over the sender's),
+        // and the receiver copies each of them in as it lands - a step of two chunks waits for the first, copies it
+        // (releasing its slot), waits for the second, copies it.  This thread runs the first part, one thread each the
+        // later ones.
         std::mutex mu;
         std::condition_variable cv;
         // produced[k]: chunks part k has put in its slots; consumed[k]: chunks part k + 1 has copied out of them
+        // (both count the sender's chunks, whatever the receiver's step is)
         std::vector<int> produced((size_t) np, 0), consumed((size_t) np, 0);
         bool stop = false;
         std::string stage_err;
-        const size_t slot = (size_t) Tc * 4 * E;
+        const auto slot_of = [&](int k) { return (size_t) parts[(size_t) k]->pf_->T_bound * 4 * E; };
         const auto fail = [&](std::string e) {
             std::lock_guard<std::mutex> lk(mu);
             if (stage_err.empty()) stage_err = std::move(e);
             stop = true;
             cv.notify_all();
         };
+        // a wait that gives up instead of freezing the server: a slip in this handshake would otherwise hang every
+        // later prompt with nothing in the log (the slowest chunk measured here is ~13.5 s, and every wait below is
+        // for something the part beside this one has already started)
+        const auto wait_or_fail = [&](const std::string& what, auto&& pred) -> bool {
+            std::unique_lock<std::mutex> lk(mu);
+            if (cv.wait_for(lk, std::chrono::seconds(120), [&] { return pred() || stop; })) return !stop;
+            lk.unlock();
+            fail("glm prefill: " + what + " waited 120 s for the part beside it");
+            return false;
+        };
         // part k has read chunk c: its rows into its slot for part k + 1
         const auto hand_on = [&](int k, int c, int T) -> bool {
             Glm5Model* m = parts[(size_t) k];
-            {
-                std::unique_lock<std::mutex> lk(mu);
-                cv.wait(lk, [&] { return consumed[(size_t) k] >= c - 1 || stop; });
-                if (stop) return false;
-            }
-            cudaMemcpyAsync(m->pf_->hop_h + (size_t) (c & 1) * slot, m->pf_->R, (size_t) T * 4 * E * sizeof(float),
+            if (!wait_or_fail("CUDA" + std::to_string(m->dev_), [&] { return consumed[(size_t) k] >= c - 1; }))
+                return false;
+            cudaMemcpyAsync(m->pf_->hop_h + (size_t) (c & 1) * slot_of(k), m->pf_->R, (size_t) T * 4 * E * sizeof(float),
                             cudaMemcpyDeviceToHost, m->fast_->cs);
             std::string e;
             if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt hop out", e)) {
@@ -3217,49 +3244,76 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 Glm5Model* m = parts[(size_t) k];
                 const Glm5Model* up = parts[(size_t) k - 1];
                 cudaSetDevice(m->dev_);
-                for (int c = 0; c < nc; ++c) {
-                    {
-                        std::unique_lock<std::mutex> lk(mu);
-                        cv.wait(lk, [&] { return produced[(size_t) k - 1] > c || stop; });
-                        if (stop) return;
-                    }
-                    const int T = chunk_len(c);
-                    const int64_t p0 = pos_start + (int64_t) c * Tc;
+                const int Tk = m->pf_->T_bound, nk = (int) ((n + Tk - 1) / Tk);   // this part's own step and steps
+                const int Tu = up->pf_->T_bound, nu = (int) ((n + Tu - 1) / Tu);  // the sender's chunk and chunks
+                if (Tk > m->prefill_chunk()) {   // (R, the slots and the carve are sized for the cap: never above it)
+                    fail("glm prefill: CUDA" + std::to_string(m->dev_) + " was carved " + std::to_string(Tk) +
+                         " tokens a step, above its " + std::to_string(m->prefill_chunk()));
+                    return;
+                }
+                const size_t slot_u = slot_of(k - 1);
+                for (int s = 0; s < nk; ++s) {
+                    const auto t_step = std::chrono::steady_clock::now();
+                    const int T = (int) std::min<int64_t>(Tk, n - (int64_t) s * Tk);
+                    const int64_t r0 = (int64_t) s * Tk;
+                    const int64_t p0 = pos_start + r0;
                     if (m->pf_->stages && m->pf_->sev_h0 != nullptr) cudaEventRecord(m->pf_->sev_h0, m->fast_->cs);
-                    m->pf_->sev_hop = m->pf_->stages;   // (this chunk arrived over the hop: the line below reads it)
-                    cudaMemcpyAsync(m->pf_->R, up->pf_->hop_h + (size_t) (c & 1) * slot,
-                                    (size_t) T * 4 * E * sizeof(float), cudaMemcpyHostToDevice, m->fast_->cs);
-                    if (m->pf_->stages && m->pf_->sev_h1 != nullptr) cudaEventRecord(m->pf_->sev_h1, m->fast_->cs);
+                    m->pf_->sev_hop = m->pf_->stages;   // (this step arrived over the hop: the line below reads it)
+                    // the sender's chunks this step covers, each copied into R the moment it lands and released the
+                    // moment it is fully copied out (its slot is free for the sender again then - never wait for all
+                    // of them before copying any, that would hold the sender's ring a step behind)
+                    int j = (int) std::min<int64_t>((int64_t) nu - 1, r0 / Tu);
+                    int64_t done = 0;
                     std::string e2;
-                    if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt hop in", e2)) {
-                        fail(e2);
-                        return;
+                    while (done < T) {
+                        if (!wait_or_fail("CUDA" + std::to_string(m->dev_) + " (part " + std::to_string(k) + ")",
+                                          [&] { return produced[(size_t) k - 1] > j; }))
+                            return;
+                        const int64_t j0 = (int64_t) j * Tu, rows_u = std::min<int64_t>(Tu, n - j0);
+                        const int64_t off = (r0 + done) - j0;
+                        const int64_t take = std::min<int64_t>(rows_u - off, (int64_t) T - done);
+                        cudaMemcpyAsync(m->pf_->R + (size_t) done * 4 * E,
+                                        up->pf_->hop_h + (size_t) (j & 1) * slot_u + (size_t) off * 4 * E,
+                                        (size_t) take * 4 * E * sizeof(float), cudaMemcpyHostToDevice, m->fast_->cs);
+                        if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt hop in", e2)) {
+                            fail(e2);
+                            return;
+                        }
+                        done += take;
+                        const int64_t got = r0 + done;   // the sender's rows copied out so far
+                        const int rel = got >= n ? nu : (int) std::min<int64_t>(nu, got / Tu);
+                        if (rel > j) {
+                            {
+                                std::lock_guard<std::mutex> lk(mu);
+                                consumed[(size_t) k - 1] = rel;
+                            }
+                            cv.notify_all();
+                        }
+                        if (off + take == rows_u) ++j;   // (a step that starts or ends inside a chunk keeps it)
                     }
-                    {
-                        std::lock_guard<std::mutex> lk(mu);
-                        consumed[(size_t) k - 1] = c + 1;
-                    }
-                    cv.notify_all();
+                    if (m->pf_->stages && m->pf_->sev_h1 != nullptr) cudaEventRecord(m->pf_->sev_h1, m->fast_->cs);
+                    m->pf_->ct_feed =
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_step).count();
                     m->pos_ = p0;
                     std::vector<int32_t> nx;
                     std::vector<const float*> im;
-                    if (m->mtp_il_ >= 0) next_of(c, nx, im);
-                    m->pf_->chunk_i = c + 1;
-                    m->pf_->chunk_n = nc;
+                    if (m->mtp_il_ >= 0) next_of(r0, T, nx, im);
+                    m->pf_->chunk_i = s + 1;
+                    m->pf_->chunk_n = nk;
                     if (!m->prefill_half(p0, T, e2, nx.empty() ? nullptr : nx.data(), im.empty() ? nullptr : im.data())) {
                         fail(e2.empty() ? "glm prefill: part " + std::to_string(k) + " failed" : e2);
                         return;
                     }
                     if (k + 1 < np) {
-                        if (!hand_on(k, c, T)) return;
+                        if (!hand_on(k, s, T)) return;
                         continue;
                     }
                     if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt pipeline", e2)) {
                         fail(e2);
                         return;
                     }
-                    if (prefill_progress && c + 1 < nc &&
-                        !prefill_progress(std::min<int64_t>(n, (int64_t) (c + 1) * Tc), n)) {
+                    if (prefill_progress && s + 1 < nk &&
+                        !prefill_progress(std::min<int64_t>(n, (int64_t) (s + 1) * Tk), n)) {
                         fail("cancelled");
                         return;
                     }
@@ -3275,6 +3329,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             const int64_t p0 = pos_start + (int64_t) c * Tc;
             if (!embed(c)) { fail(err); break; }
             std::string e1;
+            pf_->ct_feed = 0;   // (the head part reads the prompt's own rows: no hop in to wait for)
             pf_->chunk_i = c + 1;
             pf_->chunk_n = nc;
             if (!prefill_half(p0, T, e1)) {
@@ -3320,18 +3375,25 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     if (pf_->stages && n > 0 && nc > 0) {
         // the prompt's own line (the chunk lines above are the detail; this is the one a report carries): what its
         // chunks walled per part and what the hand-overs between them cost
-        std::string per_part;
+        std::string per_part, nest;
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
             if (!per_part.empty()) per_part += ", ";
             per_part += "CUDA" + std::to_string(m->dev_) + " " +
                         std::to_string((long long) std::llround(m->pf_->pr_wall)) + " ms";
             if (m->pf_->pr_hop > 0.5)
                 per_part += " (hop in " + std::to_string((long long) std::llround(m->pf_->pr_hop)) + " ms)";
+            const int Tb = m->pf_->T_bound;   // (a part whose step is longer than the head's: what it nested)
+            if (m != this && Tb > Tc) {
+                if (!nest.empty()) nest += ", ";
+                nest += "CUDA" + std::to_string(m->dev_) + " " + std::to_string((n + Tb - 1) / Tb) + " of " +
+                        std::to_string(Tb);
+            }
         }
+        const std::string shape = nest.empty() ? std::string() : " (" + nest + ")";
         std::fprintf(stderr, "glm prefill: %lld tokens in %.1f ms (%.2f ms/token, %.0f tok/s), %d chunk%s of %d "
-                             "tokens | %s\n",
+                             "tokens%s | %s\n",
                      (long long) n, ms, ms / (double) n, 1000.0 * (double) n / ms, nc, nc == 1 ? "" : "s", Tc,
-                     per_part.c_str());
+                     shape.c_str(), per_part.c_str());
     }
     static const bool verbose = getenv("STRATA_GLM_PREFILL_VERBOSE") != nullptr;
     if (verbose) {
