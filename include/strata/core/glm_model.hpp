@@ -732,7 +732,9 @@ public:
         size_t staging = 0, hop = 0;
     };
     PinnedPrompt prefill_pinned() const;
-    static size_t pool_avail(size_t free_b, size_t total_b);   // the expert pool's bytes from the free VRAM
+    static size_t pool_avail(size_t free_b, size_t total_b, int dev = -1);  // the expert pool's bytes from free VRAM
+    static size_t pool_reserve(int dev);      // the free VRAM that sizing leaves the card (STRATA_GLM_RESERVE_MB)
+    static size_t mmq_scratch_reserve();      // ... of which the prompt path's MMQ scratch pool needs this much
     // the slots a layer must keep while the pool lends the prompt path: one route's experts, the device's spares, +2
     // (Strata's floor); STRATA_GLM_PREFILL_KEEP lowers it, never below route + spares
     static int pool_keep(int n_exp_used);

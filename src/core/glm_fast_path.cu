@@ -954,9 +954,22 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         // headroom: cuBLAS-free path; the context's own growth is already allocated (state arena);
         // keep ~700 MB for the driver, the sampler and kernel launches' local memory
-        size_t reserve = (size_t) (F->unified_memory ? 1024 : 700) << 20;
-        if (const char* r = getenv("STRATA_GLM_RESERVE_MB")) reserve = (size_t) std::atoll(r) << 20;
+        size_t reserve = (getenv("STRATA_GLM_RESERVE_MB") != nullptr)
+                             ? pool_reserve(dev_)
+                             : (size_t) (F->unified_memory ? 1024 : 700) << 20;
         size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
+        // the prompt path's MMQ context keeps a scratch pool (llama.cpp's stream-k fixup tiles) that it fills lazily,
+        // out of free VRAM, on the first product of a chunk - so what the pool leaves free must cover it (the prompt
+        // path's own borrow is the tail, which this shrinks and prefill_setup sizes the chunk against)
+        if (pf_ != nullptr) {
+            const size_t sc = mmq_scratch_reserve();
+            if (sc > 0) {
+                avail -= std::min(avail, sc);
+                std::fprintf(stderr, "glm fast: CUDA%d the prompt path's MMQ scratch pool keeps %.0f MB of the free VRAM "
+                                     "(STRATA_GLM_MMQ_RESERVE_MB): the expert pool is sized without it\n",
+                             dev_, (double) sc / 1048576.0);
+            }
+        }
 #if defined(STRATA_USE_HIP)
         if (F->unified_memory) {
             // Measure after dense/KV/scratch and pinned prompt staging are allocated.
@@ -5104,9 +5117,8 @@ int Glm5Model::fast_sample_verify(strata::kernels::SamplerParams& sp, std::strin
 // counts everything this process already holds on the device, so the pool gets what such a card would have).  The
 // prompt path and the layer split search size from the same number, before the pool is carved (a discrete card's:
 // fast_setup prices a unified-memory APU's pool itself).
-size_t Glm5Model::pool_avail(size_t free_b, size_t total_b) {
-    size_t reserve = (size_t) 700 << 20;
-    if (const char* r = getenv("STRATA_GLM_RESERVE_MB")) reserve = (size_t) std::atoll(r) << 20;
+size_t Glm5Model::pool_avail(size_t free_b, size_t total_b, int dev) {
+    size_t reserve = getenv("STRATA_GLM_RESERVE_MB") != nullptr ? pool_reserve(dev) : (size_t) 700 << 20;
     size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
     if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
         avail = std::min(avail, (size_t) (std::atof(cap) * 1073741824.0));
@@ -5116,6 +5128,41 @@ size_t Glm5Model::pool_avail(size_t free_b, size_t total_b) {
         avail = std::min(avail, cap > used + reserve ? cap - used - reserve : (size_t) 0);
     }
     return avail;
+}
+
+// STRATA_GLM_RESERVE_MB: one number for every part, or one per part of the split in part order (comma-separated).  The
+// prompt path's scratch pool comes out of this (mmq_scratch_reserve), and it is not the same on every card: the part
+// whose chunk is the largest - or the one holding the head, whose chunk is sized before the others' - may need to keep
+// more free than a card whose scratch already fit.  A list longer than the split is harmless (extra numbers are
+// ignored); a shorter one reuses its last number.
+size_t Glm5Model::pool_reserve(int dev) {
+    const char* r = getenv("STRATA_GLM_RESERVE_MB");
+    if (r == nullptr) return (size_t) 700 << 20;
+    std::vector<size_t> mb;
+    for (const char* p = r; *p != '\0';) {
+        mb.push_back((size_t) std::max(0LL, std::atoll(p)));
+        const char* c = std::strchr(p, ',');
+        if (c == nullptr) break;
+        p = c + 1;
+    }
+    if (mb.empty()) return (size_t) 700 << 20;
+    const int i = std::min<int>(std::max(dev, 0), (int) mb.size() - 1);
+    return mb[(size_t) i] << 20;
+}
+
+// The prompt path's MMQ scratch pool (mmq::Context -> llama.cpp's CachingPool) allocates its buffers lazily, on the
+// first product of a chunk, and never gives them back: they are the stream-k fixup tiles of the launch (one float
+// buffer of block_nums x J x I, tens of MB, and the ids tables of the MoE path).  Nothing sizes them today, so they
+// land on free VRAM - and at a 16,384-token chunk on the head card (56 slots/layer, 4.53 GB pool + 2.89 GB held, ~110
+// MB free) the first MoE product's allocation failed and ggml_cuda_error aborted the engine mid-prompt.  The number is
+// a worst case read off a chunk of that size (STRATA_GLM_MMQ_RESERVE_MB, see its log line): both fast_setup (the pool)
+// and prefill_setup (the lendable the chunk is chosen against) subtract it, so the pool it sizes is the pool it gets.
+size_t Glm5Model::mmq_scratch_reserve() {
+    static const size_t r = [] {
+        const char* v = getenv("STRATA_GLM_MMQ_RESERVE_MB");
+        return v != nullptr ? (size_t) std::max(0LL, std::atoll(v)) << 20 : (size_t) 0;
+    }();
+    return r;
 }
 
 // The floor a lend leaves the pool: a layer keeps one route's experts and the device's spares, +2 for the token that
