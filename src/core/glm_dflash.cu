@@ -1122,6 +1122,8 @@ bool GlmDflash::reload(std::string& err) {
     if (ok)
         std::fprintf(stderr, "glm dflash: CUDA%d the drafter's %.0f MB are back\n", m.dev,
                      (double) (m.arena_bytes + m.buf_bytes) / 1048576.0);
+    else
+        std::fprintf(stderr, "glm dflash: CUDA%d the drafter did not come back: %s\n", m.dev, err.c_str());
     return ok;
 }
 

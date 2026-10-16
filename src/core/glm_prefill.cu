@@ -1409,7 +1409,12 @@ bool Glm5Model::prefill_room_open(int64_t tokens, std::string& err) {
         extra = dflash_->unload_bytes();
     }
     if (extra == 0 || stride_sum == 0) return true;   // nothing to grow: the prompt runs as it always did
-    const int k2 = (int) (extra / stride_sum);
+    // rounded up, not down: close hands back exactly k2*stride_sum bytes and the drafter's reload must live on them -
+    // a floor leaves the size modulo the stride (676 MB is 4 strides and 122 MB over here) to be found in unrelated
+    // free VRAM, which the display card that holds the drafter does not have mid-prompt: "the buffers: out of
+    // memory" at the first decode.  The overshoot is under one stride and the margin pays it; a margin that cannot
+    // falls back below and the prompt runs with the ring it came with.
+    const int k2 = (int) ((extra + stride_sum - 1) / stride_sum);
     if (k2 <= 0) return true;                         // (less than a slot a layer: not worth the round trip)
     if (dflash_ != nullptr && !dflash_->unload(err)) return false;
     // the tail's slots hold experts the decode may have put there (they are the pool's): every one of them leaves
