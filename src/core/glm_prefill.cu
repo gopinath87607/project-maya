@@ -1398,7 +1398,7 @@ bool Glm5Model::prefill_room_open(int64_t tokens, std::string& err) {
         const char* v = getenv("STRATA_GLM_ROOM_MIN");
         return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : (int64_t) 8192;
     }();
-    if (tokens < min_tokens || S->tail_grown_k > 0) return true;
+    if (tokens < min_tokens || S->tail_grown_k > 0 || S->lendable_fixed != 0) return true;
     size_t stride_sum = 0;
     for (int il = l0_; il < lt_; ++il)
         if (F->L[(size_t) il].moe) stride_sum += F->lp[(size_t) il].stride;
@@ -1408,7 +1408,42 @@ bool Glm5Model::prefill_room_open(int64_t tokens, std::string& err) {
         cudaSetDevice(dev_);
         extra = dflash_->unload_bytes();
     }
-    if (extra == 0 || stride_sum == 0) return true;   // nothing to grow: the prompt runs as it always did
+    if (extra == 0) {
+        // No drafter here (or it holds nothing): the NextN block's own slots are the decode-only memory this part
+        // has, and fast_setup laid every one of them in the lendable tail (its n_main is 0).  They are already inside
+        // this region, so nothing is freed or reallocated: the budget becomes the region itself - the same budget the
+        // drafter's growth hands over - and the ring takes what the boot chooser left on the table.  A part with no
+        // ring configured has nowhere to put it and keeps the layout it booted with.
+        const bool draft = mtp_il_ >= l0_ && mtp_il_ < lt_ && F->L[(size_t) mtp_il_].moe;
+        if (!draft || F->lp[(size_t) mtp_il_].n_main != 0 || stride_sum == 0) return true;
+        S->np_saved = S->NP;
+        S->pbuf_saved = S->pbuf_bytes;
+        S->borrow_saved = S->borrow_bytes;
+        S->lendable_fixed = F->xpool_bytes;
+        const auto pick = S->choose(S->lend_pct, S->T);
+        if (pick.first == S->T && pick.second > S->NP) {
+            S->NP = pick.second;
+            S->pbuf_bytes = (size_t) pick.second * S->gstride;
+            Carve c;
+            c.take<uint8_t>(S->arena_bytes);
+            c.take<uint16_t>((size_t) S->w16_elems);
+            c.take<float>(S->w32_elems);
+            c.take<uint8_t>(S->ws_bytes);
+            c.take<uint8_t>(S->gbuf_bytes);
+            c.take<uint8_t>(S->pbuf_bytes);
+            S->borrow_bytes = c.off;
+            if (!prefill_bind(F->xpool, F->xpool_bytes, err)) return false;
+            std::fprintf(stderr, "glm prefill: CUDA%d the draft layer's %d experts are the prompt's to take: the "
+                                 "prestage ring %d -> %d experts, borrowing %.0f MB\n", dev_,
+                         F->lp[(size_t) mtp_il_].n, S->np_saved, S->NP, (double) S->borrow_bytes / 1048576.0);
+        } else {
+            S->lendable_fixed = 0;
+            std::fprintf(stderr, "glm prefill: CUDA%d the draft layer's room is the prompt's to take, but there is no "
+                                 "ring to fill (%d experts): the prompt runs as it was\n", dev_, S->NP);
+        }
+        return true;
+    }
+    if (stride_sum == 0) return true;                 // nothing to grow: the prompt runs as it always did
     // rounded up, not down: close hands back exactly k2*stride_sum bytes and the drafter's reload must live on them -
     // a floor leaves the size modulo the stride (676 MB is 4 strides and 122 MB over here) to be found in unrelated
     // free VRAM, which the display card that holds the drafter does not have mid-prompt: "the buffers: out of
@@ -1548,6 +1583,14 @@ bool Glm5Model::prefill_room_close(std::string& err) {
             S->tail_grown_k = 0;
             if (!prefill_bind(F->xpool, F->xpool_bytes, err)) ok = false;
         }
+    } else if (S->lendable_fixed != 0) {
+        // the NextN block's room (room_open's drafter-less branch): the tail itself never moved - its slots were in
+        // this region all along - so this is the ring and the borrow going back to what fast_setup sized, nothing else
+        S->NP = S->np_saved;
+        S->pbuf_bytes = S->pbuf_saved;
+        S->borrow_bytes = S->borrow_saved;
+        S->lendable_fixed = 0;
+        if (!prefill_bind(F->xpool, F->xpool_bytes, err)) ok = false;
     }
     if (dflash_ != nullptr && !dflash_->reload(err)) ok = false;
     return ok;
