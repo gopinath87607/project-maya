@@ -1444,16 +1444,20 @@ bool Glm5Model::prefill_return(std::string& err) {
 // chunk does not change (its pinned staging, its mixers and the split's pacing are sized from it): it is the ring,
 // the layer's predicted experts in VRAM before they are routed, that grows.  Called before the first chunk's carve
 // and lend; prefill_room_close puts everything back after prefill_return.
-bool Glm5Model::prefill_room_open(int64_t tokens, std::string& err) {
+bool Glm5Model::prefill_room_open(int64_t tokens_read, std::string& err) {
     FastState* F = fast_;
     PrefillState* S = pf_;
     if (F == nullptr || S == nullptr) return true;
-    // a short prompt pays more for the round trip (~0.7 GB each way) than a bigger ring gives back
+    // A short read pays more for the round trip (~0.7 GB each way) than a bigger ring gives back.  `0` = every
+    // request.  TOKENS counts what this call READS, not the whole prompt: prefill() is handed only the part past the
+    // reused prefix (generate.cpp slices at `reuse`), so an agent turn that re-sends a long conversation and reads a
+    // few hundred tokens does not take the room - the same correctness fix as Strata's serving loop, which used to
+    // test the whole prompt there.
     static const int64_t min_tokens = [] {
         const char* v = getenv("STRATA_GLM_ROOM_MIN");
         return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : (int64_t) 8192;
     }();
-    if (tokens < min_tokens || S->tail_grown_k > 0 || S->lendable_fixed != 0) return true;
+    if (tokens_read < min_tokens || S->tail_grown_k > 0 || S->lendable_fixed != 0) return true;
     size_t stride_sum = 0;
     for (int il = l0_; il < lt_; ++il)
         if (F->L[(size_t) il].moe) stride_sum += F->lp[(size_t) il].stride;
@@ -3725,7 +3729,8 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
             step = nchunks > 1 && own != T0 ? (int) std::min<int64_t>((int64_t) own, n64) : std::min(step, own);
         }
         cudaSetDevice(m->dev_);
-        // a long prompt: this part's decode-only room, taken before the carve lays the buffers over the tail
+        // a long READ (nn: this prefill call's tokens, never the reused prefix): this part's decode-only room,
+        // taken before the carve lays the buffers over the tail
         if (!m->prefill_room_open(nn, err)) {
             ok = false;
             break;
