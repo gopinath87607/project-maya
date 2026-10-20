@@ -1,0 +1,17 @@
+{
+ "exe": "/home/gopi/project-maya/build/maya-ds4",
+ "args": [
+  "--pack",
+  "/mnt/nvme/ds4-ud-iq3xxs/maya-ds4"
+ ],
+ "cwd": "/home/gopi/project-maya",
+ "tokenizer": "/mnt/nvme/ds4-ud-iq3xxs/maya-ds4/tokenizer",
+ "model_name": "deepseek-v4.1-flash",
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95
+ },
+ "fit_max_tokens": true,
+ "port": 8080,
+ "log": "/home/gopi/project-maya/maya-ds4.log"
+}

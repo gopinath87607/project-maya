@@ -54,13 +54,13 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(maya.EXE, self.root / "build-hip/maya")
 
     def test_rdna2_is_experimental_and_compiled_only_when_chosen(self):
-        pc = maya.check_pc(self.a)      # the RX 7900 XT: the three architectures, as before
-        self.assertEqual(pc["archs"], list(maya.HIP_ARCHS))
+        pc = maya.check_pc(self.a)      # the RX 7900 XT: its own architecture only (#255)
+        self.assertEqual(pc["archs"], ["gfx1100"])
         self.gpus.append({"index": 3, "arch": "gfx1030", "vendor": "amd", "name": "Radeon PRO V620", "vram_gb": 32})
         self.a.gpu = 3
         pc = maya.check_pc(self.a)
         self.assertEqual(pc["gpus"], [self.gpus[3]])
-        self.assertEqual(pc["archs"], list(maya.HIP_ARCHS) + ["gfx1030"])
+        self.assertEqual(pc["archs"], ["gfx1030"])     # no WMMA arch: no rocWMMA needed (ROCm 7 has none)
 
     def test_rejects_unsupported_card_and_bad_gpu_lists(self):
         self.a.gpu = 2
@@ -203,7 +203,7 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("-DSTRATA_ENABLE_HIP=ON", conf)
         self.assertIn("-DSTRATA_ENABLE_CUDA=OFF", conf)
         self.assertIn("-DSTRATA_PREFILL_MMQ=ON", conf)
-        self.assertIn("-DCMAKE_HIP_ARCHITECTURES=gfx1100;gfx1201;gfx1151", conf)
+        self.assertIn("-DCMAKE_HIP_ARCHITECTURES=gfx1100", conf)     # the chosen card's (#255)
         self.assertEqual(env["ROCM_PATH"], str(self.rocm))
         self.assertEqual(meta["backend"], "hip")
 
@@ -563,16 +563,30 @@ class WindowsHipSetupTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 maya.check_pc(self.a)
 
-    def test_visual_studio_2026_is_taken_for_hip_not_for_cuda(self):
+    def test_visual_studio_2026_is_taken_for_hip_and_for_a_cuda_13_2_toolkit(self):
         pf = self.root / "pf86"
         (pf / "Microsoft Visual Studio/Installer").mkdir(parents=True)
         (pf / "Microsoft Visual Studio/Installer/vswhere.exe").touch()
         vs = self.root / "VS2026"
         (vs / "VC/Auxiliary/Build").mkdir(parents=True)
         (vs / "VC/Auxiliary/Build/vcvars64.bat").touch()
-        only_2026 = lambda cmd: "" if "-version" in cmd else str(vs)
+        nvcc = self.root / "cuda13.4/bin/nvcc.exe"       # NVIDIA's install guide: 13.2+ takes VS 2026 (MSVC 195x)
+        nvcc.parent.mkdir(parents=True)
+        nvcc.touch()
+        nvcc12 = self.root / "cuda12.8/bin/nvcc.exe"     # 12.x and CUDA <= 13.1 stop at VS 2022 (MSVC 193x)
+        nvcc12.parent.mkdir(parents=True)
+        nvcc12.touch()
+        releases = {str(nvcc): "Cuda compilation tools, release 13.4, V13.4.159\n",
+                    str(nvcc12): "Cuda compilation tools, release 12.8, V12.8.93\n"}
+
+        def only_2026(cmd):        # nvcc --version answers; vswhere finds VS 2026 only, never the 2019/2022 range
+            if cmd[1:] == ["--version"]:
+                return releases.get(cmd[0], "")
+            return "" if "[16.0,18.0)" in cmd else str(vs)
         with patch.dict(os.environ, {"ProgramFiles(x86)": str(pf)}), patch.object(maya.S, "out", side_effect=only_2026):
-            self.assertIsNone(FIND_VCVARS())                         # CUDA 12/13: 2019 or 2022 only
+            self.assertIsNone(FIND_VCVARS())                         # CUDA, no toolkit given: 2019/2022 only
+            self.assertIsNone(FIND_VCVARS(nvcc=str(nvcc12)))          # CUDA 12.8: its release stops at VS 2022
+            self.assertEqual(FIND_VCVARS(nvcc=str(nvcc)), vs / "VC/Auxiliary/Build/vcvars64.bat")
             self.assertEqual(FIND_VCVARS(cuda=False), vs / "VC/Auxiliary/Build/vcvars64.bat")
 
     def test_rocm_sdk_init_runs_before_any_path_query(self):
@@ -694,7 +708,7 @@ class WindowsHipSetupTests(unittest.TestCase):
                      f"-DCMAKE_HIP_COMPILER={root}/lib/llvm/bin/clang++.exe",
                      f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                      "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_PREFILL_MMQ=ON",
-                     "-DSTRATA_PORTABLE=ON", "-DCMAKE_HIP_ARCHITECTURES=gfx1100;gfx1201;gfx1151"):
+                     "-DSTRATA_PORTABLE=ON", "-DCMAKE_HIP_ARCHITECTURES=gfx1151"):
             self.assertIn(want, conf)
         if " " not in root:
             self.assertIn(f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={root}/lib/llvm/amdgcn/bitcode",

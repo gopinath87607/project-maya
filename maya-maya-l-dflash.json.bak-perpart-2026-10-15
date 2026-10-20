@@ -1,0 +1,56 @@
+{
+  "exe": "/home/gopi/project-maya/build/strata",
+  "args": [
+    "--glm-pack",
+    "/mnt/nvme/pack",
+    "--max-context",
+    "260000",
+    "--layer-split",
+    "10,21,33",
+    "--prefill",
+    "16384",
+    "--glm-ram-resident",
+    "--spec",
+    "4",
+    "--spec-min-p",
+    "0.5",
+    "--dflash",
+    "/mnt/nvme/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf"
+  ],
+  "cwd": "/home/gopi/project-maya",
+  "tokenizer": "/mnt/nvme/pack/tokenizer",
+  "model_name": "glm-5.3-flash",
+  "gpu": [
+    3,
+    2,
+    0,
+    1
+  ],
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95
+  },
+  "reasoning_effort": "high",
+  "fit_max_tokens": true,
+  "lib_dirs": [
+    "/usr/local/cuda-13.2/lib64",
+    "/usr/local/cuda-13.2/targets/x86_64-linux/lib"
+  ],
+  "port": 8080,
+  "env": {
+    "STRATA_GLM_SLOT_DIR": "/home/gopi/.cache/maya-slots",
+    "STRATA_GLM_CPU_LANE": "38",
+    "STRATA_GLM_PRESTAGE": "160",
+    "STRATA_GLM_RESERVE_MB": "400,100,100,100",
+    "STRATA_GLM_PREFILL_KEEP": "11",
+    "STRATA_GLM_CKPT_EVERY": "0"
+  },
+  "log": "/home/gopi/project-maya/maya-maya-l-dflash.log",
+  "installer": {
+    "models_dir": "/home/gopi/Maya-data/models",
+    "quant": "Maya-L",
+    "gguf": "/mnt/nvme/GLM-5.3-Flash-Maya-L-IQ3_S-00001-of-00004.gguf",
+    "gguf_dir": "/mnt/nvme",
+    "written": "2026-10-11 13:48"
+  }
+}

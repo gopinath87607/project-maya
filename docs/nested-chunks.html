@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Nested Prefill Chunks</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #faf9f6; --fg: #1c1b18; --muted: #6b665c; --rule: #e3dfd7;
+    --track: #f1eee8; --blk: #cfdcef; --blk-line: #9db3d3; --accent: #37507d;
+    --good: #2e6b45; --bad: #9a3b2e; --card: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #16181c; --fg: #e8e6e1; --muted: #9a958c; --rule: #2b2f36;
+      --track: #1e2126; --blk: #2c3c56; --blk-line: #4a6591; --accent: #9db6de;
+      --good: #7fc39b; --bad: #e08d7e; --card: #1b1e23;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #16181c; --fg: #e8e6e1; --muted: #9a958c; --rule: #2b2f36;
+    --track: #1e2126; --blk: #2c3c56; --blk-line: #4a6591; --accent: #9db6de;
+    --good: #7fc39b; --bad: #e08d7e; --card: #1b1e23;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding-block: 40px 64px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+  main { max-width: 880px; margin: 0 auto; display: flex; flex-direction: column; gap: 34px; }
+  h1 { font-size: 26px; line-height: 1.2; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.09em; color: var(--muted);
+       margin: 0 0 12px; font-weight: 600; }
+  p { margin: 0; }
+  .lede { color: var(--muted); max-width: 62ch; }
+  figure { margin: 0; display: flex; flex-direction: column; gap: 14px; }
+  figcaption { color: var(--muted); font-size: 13.5px; max-width: 68ch; }
+  figcaption b { color: var(--fg); font-weight: 600; }
+  .scroll { overflow-x: auto; }
+  .diagram { min-width: 620px; display: flex; flex-direction: column; gap: 6px; }
+  .row { display: grid; grid-template-columns: 74px 1fr 104px; gap: 10px; align-items: center; }
+  .lbl { font-size: 12.5px; font-weight: 600; letter-spacing: 0.02em; }
+  .lbl span { display: block; font-weight: 400; color: var(--muted); font-size: 11px; letter-spacing: 0; }
+  .track {
+    display: grid; grid-template-columns: repeat(16, 1fr); gap: 2px;
+    background: var(--track); padding: 3px; border-radius: 5px; min-height: 30px;
+    align-items: stretch;
+  }
+  .blk {
+    background: var(--blk); border: 1px solid var(--blk-line); border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; color: var(--accent); font-variant-numeric: tabular-nums;
+    white-space: nowrap; overflow: hidden;
+  }
+  .blk.plain { background: transparent; border-color: transparent; }
+  .badge { font-size: 11.5px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+  .badge b { color: var(--fg); font-weight: 600; }
+  .axis { display: grid; grid-template-columns: 74px 1fr 104px; gap: 10px; }
+  .axis .t { grid-column: 2; display: grid; grid-template-columns: repeat(3, 1fr);
+             font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .axis .t :last-child { text-align: right; }
+  .key { font-size: 12px; color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--rule); }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+  td .y { color: var(--good); } td .n { color: var(--bad); }
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 22px; }
+  .card { background: var(--card); border: 1px solid var(--rule); border-radius: 8px; padding: 16px 18px; }
+  .card h3 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+  .card ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; font-size: 13.5px; }
+  .card p { font-size: 13.5px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+</style>
+</head>
+<body>
+<main>
+  <header style="display:flex;flex-direction:column;gap:10px">
+    <h1>Nested prefill chunks</h1>
+    <p class="lede">A prefill chunk is one token range that every GPU walks in order
+      (layers 0-11 → 12-22 → 23-34 → 35-44), so today all four run the same size — the
+      smallest part's. Nesting gives each part its own number, as long as it is a whole
+      multiple of the part feeding it.</p>
+  </header>
+
+  <figure>
+    <h2>Today — one number for everyone</h2>
+    <div class="scroll">
+      <div class="diagram">
+        <div class="row"><div class="lbl">CUDA0<span>5060 · 9 MoE</span></div>
+          <div class="track">
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+          </div>
+          <div class="badge">sweeps <b>8</b></div></div>
+        <div class="row"><div class="lbl">CUDA1<span>5060 · 11 MoE</span></div>
+          <div class="track">
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+          </div>
+          <div class="badge">sweeps <b>8</b></div></div>
+        <div class="row"><div class="lbl">CUDA2<span>3060 · 12 MoE</span></div>
+          <div class="track">
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+          </div>
+          <div class="badge">sweeps <b>8</b></div></div>
+        <div class="row"><div class="lbl">CUDA3<span>3060 · 10 MoE</span></div>
+          <div class="track">
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+          </div>
+          <div class="badge">sweeps <b>8</b></div></div>
+        <div class="axis"><div class="t"><span>0</span><span>32,768</span><span>65,536 tokens</span></div></div>
+      </div>
+    </div>
+    <figcaption>CUDA0 can only lend 2,642 MB, so <b>every</b> part runs 8,192-token chunks —
+      including the two 3060s sitting on 6.7 and 6.3 GB they never get to use. Each block pays a
+      full expert sweep (≈19-21 GB over PCIe).</figcaption>
+  </figure>
+
+  <figure>
+    <h2>Nested — each part its own number</h2>
+    <div class="scroll">
+      <div class="diagram">
+        <div class="row"><div class="lbl">CUDA0<span>5060 · 9 MoE</span></div>
+          <div class="track">
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+            <div class="blk" style="grid-column:span 2">8192</div><div class="blk" style="grid-column:span 2">8192</div>
+          </div>
+          <div class="badge">sweeps <b>8</b></div></div>
+        <div class="row"><div class="lbl">CUDA1<span>5060 · 11 MoE</span></div>
+          <div class="track">
+            <div class="blk" style="grid-column:span 4">16384</div><div class="blk" style="grid-column:span 4">16384</div>
+            <div class="blk" style="grid-column:span 4">16384</div><div class="blk" style="grid-column:span 4">16384</div>
+          </div>
+          <div class="badge">sweeps <b>4</b></div></div>
+        <div class="row"><div class="lbl">CUDA2<span>3060 · 12 MoE</span></div>
+          <div class="track">
+            <div class="blk" style="grid-column:span 8">32768</div><div class="blk" style="grid-column:span 8">32768</div>
+          </div>
+          <div class="badge">sweeps <b>2</b></div></div>
+        <div class="row"><div class="lbl">CUDA3<span>3060 · 10 MoE</span></div>
+          <div class="track">
+            <div class="blk" style="grid-column:span 8">32768</div><div class="blk" style="grid-column:span 8">32768</div>
+          </div>
+          <div class="badge">sweeps <b>2</b></div></div>
+        <div class="axis"><div class="t"><span>0</span><span>32,768</span><span>65,536 tokens</span></div></div>
+      </div>
+    </div>
+    <p class="key">One cell = 4,096 tokens. Blocks line up exactly: CUDA1's chunk covers two of
+      CUDA0's, CUDA2's covers two of CUDA1's. "Sweeps" = expert stagings paid per 65,536 tokens.</p>
+    <figcaption>CUDA0 keeps 8,192 — it is the tight card and the one nobody can feed for it.
+      The other three take as big a bite as their own pool allows, so <b>their</b> staging is paid
+      4 and 2 times instead of 8. Same tokens, same order, same answers: only the block size
+      differs, and every block still lines up with the one before it.</figcaption>
+  </figure>
+
+  <section>
+    <h2>Can each part actually hold these?</h2>
+    <table>
+      <thead>
+        <tr><th>part</th><th>can lend</th><th>8,192</th><th>16,384</th><th>32,768</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>CUDA0</td><td>2,642 MB</td><td class="y">2,048 ✓</td><td class="n">3,020 ✗</td><td class="n">4,720 ✗</td></tr>
+        <tr><td>CUDA1</td><td>3,208 MB</td><td class="y">2,033 ✓</td><td class="n">3,005 ✗*</td><td class="n">4,720 ✗</td></tr>
+        <tr><td>CUDA2</td><td>6,720 MB</td><td class="y">2,033 ✓</td><td class="y">3,005 ✓</td><td class="y">4,950 ✓</td></tr>
+        <tr><td>CUDA3</td><td>6,339 MB</td><td class="y">2,048 ✓</td><td class="y">3,020 ✓</td><td class="y">4,965 ✓</td></tr>
+      </tbody>
+    </table>
+    <p class="key" style="margin-top:10px">*CUDA1's 16,384 fits against the raw number but not
+      against the extra 256 MB guard the sizing keeps — the same 300 MB of reserve would settle it.
+      Numbers from <code>830 MB + 0.119 MB a token + 96 scratch + 134-149 staging</code>, measured
+      on this box.</p>
+  </section>
+
+  <div class="cols">
+    <div class="card">
+      <h3>What it buys</h3>
+      <ul>
+        <li>Uses memory that is <b>already free</b> on the two 3060s instead of hunting for 600 MB on the 5060s.</li>
+        <li>Expert staging is the biggest item on a chunk (55% of CUDA0's 5,483 ms) — paying it once per 16k/32k instead of once per 8k is a real per-token cut on three of the four parts.</li>
+        <li>Nothing in the model changes: positions, KV and checkpoint marks are absolute.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>What it costs</h3>
+      <ul>
+        <li>A piece's wall is <code>Σ(parts) + (chunks−1) × max(part)</code> — longer stages make the fill of every piece longer.</li>
+        <li>CUDA0 stays the pacing stage: it is the one part nesting does not speed up.</li>
+        <li>The hand-off loop assumes one hop per chunk — that bookkeeping (events, prestage, next-chunk plan) is the risky part, so it needs its own A/B.</li>
+      </ul>
+    </div>
+  </div>
+</main>
+</body>
+</html>

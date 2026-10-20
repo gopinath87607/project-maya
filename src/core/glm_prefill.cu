@@ -98,6 +98,7 @@ constexpr int kSub = 256;   // the sub-batch the mixers, the dense FFN and the s
 // the loan (past a layout's need) the MMQ kernels' stream-k fixup buffers get: see prefill_lend and the pool's
 // size classes (src/prefill/ggml_cuda_host.cu) for why 16 MB bounds every product a chunk launches, at any chunk size
 constexpr size_t kMmqSlab = (size_t) 16 << 20;
+constexpr int kShSub = 2048;   // the shared expert's on CUDA (shexp_sub)
 // prestaging (PrefillState::pbuf): the buffer's slots on one GPU, the chunk from which it is carved, and the fewest
 // predicted rows an expert is prestaged for (below that it may not be routed at all)
 constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
@@ -172,6 +173,52 @@ MlaAttnPath mla_attn_path() {
     return gb::mla_wmma2_default() ? MlaAttnPath::WMMA2 : MlaAttnPath::F16Q;
 }
 #endif
+// The Volta grouped-WMMA MoE products (STRATA_PF_WMMA, the same switch as the Qwen prompt path): the FP16
+// tensor-core grouped GEMM replaces MMQ's dp4a products for a layer whose gate/up and down are IQ formats the
+// kernel decodes (its gate/up tile is 256 values wide, so E must split into whole 256-value chunks; its down
+// kernels cover IQ4_NL / Q2_0 at any K % 128 and IQ3_S / IQ3_XXS / IQ2_S at any K % 256 - E = 4096 and
+// n_ff = 2048 both do).  The products read FP16 activations, which the run_set's WMMA branch converts into the
+// Xq / Hq buffers - FP16 is 2 bytes a value where the q8_1 layout reserves 1.125, so carve_moe sizes those two
+// buffers for it (env_on alone: the carve runs at three call sites that must agree on one layout, so it cannot
+// carry the per-device probe below).  The probe is per device, so a layer asks each time and the log line prints
+// once per device.
+bool wmma_env_on() {
+    static const bool want = [] {
+        const char* v = getenv("STRATA_PF_WMMA");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return want;
+}
+bool moe_wmma_on(int gu_type, int d_type, int E, int nff) {
+#if defined(STRATA_USE_HIP)
+    (void) gu_type; (void) d_type; (void) E; (void) nff;
+    return false;
+#else
+    if (!wmma_env_on()) return false;
+    // the gate/up product's K is E (its tile is 256 values wide); the down product's K is n_ff, where the IQ4_NL and
+    // Q2_0 kernels work on 32- and 64-value blocks (K % 128) and the IQ3_*/IQ2_S half-superblock decoders on
+    // 128-value halves of a 256-value superblock (K % 256)
+    const bool gu_ok = (gu_type == 18 || gu_type == 21 || gu_type == 22 || gu_type == 23) && E % 256 == 0;
+    const bool dn_ok = (d_type == 20 || d_type == 42) ? nff % 128 == 0
+                                                      : (d_type == 18 || d_type == 21 || d_type == 22) && nff % 256 == 0;
+    if (!gu_ok || !dn_ok) return false;
+    static thread_local int probed = -1;
+    static thread_local bool ok = false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (dev != probed) {
+        // Volta (sm_70) only, as the Qwen pack's path (prefill.cpp's wmma_buffers): Turing and newer run MMQ on the
+        // int8 tensor cores, where the FP16 tiles are not measured
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        ok = major == 7 && minor == 0 && strata::kernels::gemm_iq_f16_grouped_supported(dev);
+        probed = dev;
+        if (ok) std::fprintf(stderr, "glm prefill: Volta grouped-WMMA prompt experts on (CUDA%d)\n", dev);
+    }
+    return ok;
+#endif
+}
 struct DsaBufs {
     float *qr_raw, *qr, *kv_raw, *ik_raw, *ig_raw, *iw, *q, *iq, *score, *q_abs, *ctx, *attn;
     uint16_t *qr16, *attn16;
@@ -265,6 +312,11 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
         h_bytes = std::max(h_bytes, strata::prefill::rdna4::act_bytes(W, g.n_ff_exp));
     }
 #endif
+    if (wmma_env_on()) {   // the WMMA branch's FP16 activation windows (a part's rows, at most W): 2 bytes a value
+                           // where the q8_1 layout reserves 1.125 (block_q8_1_mmq is 144 bytes per 128 values)
+        x_bytes = std::max(x_bytes, (size_t) W * (size_t) g.n_embd * 2);
+        h_bytes = std::max(h_bytes, (size_t) W * (size_t) g.n_ff_exp * 2);
+    }
     b.Xq = c.take<uint8_t>(x_bytes);
     b.Hq = c.take<uint8_t>(h_bytes);
     // each set's gate/up rows live in its own OUTP rows until the down product, the swiglu over their gate halves
@@ -275,6 +327,21 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
     b.sh_u = c.take<float>(ts * FF);
     b.sh16 = c.take<uint16_t>(ts * FF);
     return b;
+}
+
+// the shared expert's sub-batch: each one dequantizes its three matrices to FP16 again, so on CUDA it runs in larger
+// ones than the mixers; STRATA_GLM_PREFILL_SH_SUB overrides, sub_env sets it
+int shexp_sub(int sub_env) {
+    if (sub_env > 0) return sub_env;
+#if defined(STRATA_USE_HIP)
+    return kSub;
+#else
+    static const int v = [] {
+        const char* e = getenv("STRATA_GLM_PREFILL_SH_SUB");
+        return e ? std::clamp(std::atoi(e), 16, 8192) : kShSub;
+    }();
+    return v;
+#endif
 }
 
 // the mixers' and the dense FFN's sub-batch for chunks of T tokens: kSub, doubled (up to 4096) while their buffers
@@ -319,7 +386,7 @@ struct Glm5Model::PrefillState {
     bool lend_pct_fixed = false;
     std::string mode;
     int sub_env = 0;                 // STRATA_GLM_PREFILL_SUB: every sub-batch (0: mixer_sub, the shared expert kSub)
-    int sh_sub() const { return sub_env > 0 ? sub_env : kSub; }   // the shared expert's sub-batch
+    int sh_sub() const { return shexp_sub(sub_env); }   // the shared expert's sub-batch
     int max_pools = 0;
     cublasHandle_t blas = nullptr;
     void* ws = nullptr;
@@ -1063,7 +1130,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     if (has_kda) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); }
     if (has_dsa) { Carve d; carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
     if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
-    if (has_moe) { Carve m; carve_moe(m, T, (size_t) (sub_env > 0 ? sub_env : kSub), g); uni = std::max(uni, m.off); }
+    if (has_moe) { Carve m; carve_moe(m, T, (size_t) shexp_sub(sub_env), g); uni = std::max(uni, m.off); }
     // the NextN block's cache fill (the last half) carves 4 n_embd + 1.5 n_embd rows of its own
     if (mtp) uni = std::max(uni, T * (size_t) (6 * g.n_embd + g.kv_lora + 2 * g.idx_key) * 4 + 8 * 256);
     return {a.off, uni};
@@ -2222,8 +2289,53 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 sgemm_bf16(Ly.f_b, DI, HD, B.fa, HD, B.g1, DI, tn, 1.0f);
                 sgemm_bf16(Ly.g_b, DI, HD, B.ga, HD, B.g2, DI, tn, 1.0f);
                 S->mark("kda_proj", s);
-                gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta,
-                            state_ + kda_S_[(size_t) il], B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
+                // the recurrence over n_head x 4 blocks (kda_rec_split: the value columns are independent) instead of
+                // one block a head - 32 blocks for a V100's 80 SMs.  Maya-S24, 27K prompts: kda_rec 4.7 / 5.1 -> 3.5 s
+                // (8 blocks a head: 5.3 / 5.5 s); state and output within 1e-7 of the one-block kernel.
+                // STRATA_GLM_KDA_SPLIT=0 / 8: the one-block kernel / 8 a head.  STRATA_GLM_KDA_SPLIT_CHECK=1 (debug):
+                // the one-block kernel on a copy too, compared
+                static const int kda_split = [] {
+                    const char* v = getenv("STRATA_GLM_KDA_SPLIT");
+                    const int n = v ? std::atoi(v) : 4;
+                    return n == 4 || n == 8 ? n : 0;
+                }();
+                float* Sl = state_ + kda_S_[(size_t) il];
+                if (kda_split > 0) {
+                    static const bool chk = getenv("STRATA_GLM_KDA_SPLIT_CHECK") != nullptr;
+                    const size_t sn = (size_t) g.n_head * 128 * 128, on = (size_t) tn * DI;
+                    float* rs = nullptr;
+                    __half* ro = nullptr;
+                    if (chk && cudaMalloc(&rs, sn * 4) == cudaSuccess && cudaMalloc(&ro, on * 2) == cudaSuccess) {
+                        cudaMemcpyAsync(rs, Sl, sn * 4, cudaMemcpyDeviceToDevice, s);
+                        gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta, rs,
+                                    B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, ro, s);
+                    }
+                    gb::kda_rec_split(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta, Sl,
+                                      B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s, kda_split);
+                    if (rs != nullptr && ro != nullptr) {
+                        std::vector<float> a1(sn), a2(sn);
+                        std::vector<__half> o1(on), o2(on);
+                        cudaStreamSynchronize(s);
+                        cudaMemcpy(a1.data(), Sl, sn * 4, cudaMemcpyDeviceToHost);
+                        cudaMemcpy(a2.data(), rs, sn * 4, cudaMemcpyDeviceToHost);
+                        cudaMemcpy(o1.data(), B.out16, on * 2, cudaMemcpyDeviceToHost);
+                        cudaMemcpy(o2.data(), ro, on * 2, cudaMemcpyDeviceToHost);
+                        double ns = 0, ds = 0, no = 0, dd = 0;
+                        for (size_t i = 0; i < sn; ++i) { const double d = a1[i] - a2[i]; ns += d * d; ds += (double) a2[i] * a2[i]; }
+                        for (size_t i = 0; i < on; ++i) {
+                            const double x = __half2float(o1[i]), y = __half2float(o2[i]);
+                            no += (x - y) * (x - y);
+                            dd += y * y;
+                        }
+                        std::fprintf(stderr, "glm prefill kda split check: layer %d, %d tokens, state rel L2 %.3e, out %.3e\n",
+                                     il, tn, std::sqrt(ns / std::max(1e-30, ds)), std::sqrt(no / std::max(1e-30, dd)));
+                    }
+                    if (rs) cudaFree(rs);
+                    if (ro) cudaFree(ro);
+                } else {
+                    gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta, Sl, B.g2,
+                                Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
+                }
                 S->mark("kda_rec", s);
                 if (!skip_output) hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
             } else {
@@ -2845,6 +2957,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             return v == nullptr || std::atoi(v) != 0;
         }();
         const bool glu = glu_on && mmq::glu_supported(Ly.gu_type, nff);
+        // the Volta grouped-WMMA products for this layer (STRATA_PF_WMMA): the run_set's branch below converts the
+        // activations to FP16 and runs both products on the tensor cores; a rejected launch falls back to MMQ once
+        const bool wmma = moe_wmma_on(Ly.gu_type, Ly.d_type, E, nff);
+        static bool wmma_fell_back = false;
 #if defined(STRATA_HIP_PREFILL_FUSED)
         // X is rounded once per token; the fused GU epilogue writes rounded H.
         // The shared scratch reserves the larger of the two activation formats.
@@ -2882,10 +2998,35 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         continue;
                     }
 #endif
-                    mmq::quantize(S->x, M.row_tok + r0 + a, M.Xq, Ly.gu_type, E, E, nrows, s);
-                    // the part's bounds are the set's (from a): the activations and the destination are addressed a
-                    // rows back so that bound a is the part's first row
                     float* GU = M.OUTP + (size_t) o * E;   // 2 * n_ff == n_embd: the set's own OUTP rows hold its gate/up
+                    if (wmma && !wmma_fell_back) {
+                        // the FP16 tensor-core products: the part's rows gathered from S->x into Xq (the q8_1 sizing
+                        // covers W * E halves), the FP32 gate/up split through the clamped swiglu into Hq (its q8_1
+                        // sizing covers W * n_ff halves), the down back into the window's OUTP rows.  The bounds are
+                        // the set's from a and the activations start a rows back, as in the MMQ products' trick.
+                        auto* x16 = reinterpret_cast<uint16_t*>(M.Xq) - (size_t) a * E;
+                        auto* h16 = reinterpret_cast<uint16_t*>(M.Hq) - (size_t) a * nff;
+                        strata::kernels::exl3::rows_f16(S->x, E, M.row_tok + r0 + a, nrows, E, x16 + (size_t) a * E, s);
+                        if (!strata::kernels::gemm_iq_f16_grouped(Ly.gu_type, wbase + (size_t) i0 * stride, stride,
+                                2 * nff, E, x16, E, d_bounds + i0, i1 - i0, max_rows, GU - (size_t) a * (2 * nff),
+                                2 * nff, s)) {
+                            wmma_fell_back = true;
+                            std::fprintf(stderr, "glm prefill: grouped WMMA rejected the gate/up shape, MMQ from here\n");
+                        } else {
+                            gb::swiglu_rows_h16(GU, h16 + (size_t) a * nff, nrows, nff, g.swiglu_exp, s);
+                            if (!strata::kernels::gemm_iq_f16_grouped(Ly.d_type, wbase + (size_t) i0 * stride + Ly.down_off,
+                                    stride, E, nff, h16, nff, d_bounds + i0, i1 - i0, max_rows,
+                                    M.OUTP + (size_t) (o - a) * E, E, s)) {
+                                wmma_fell_back = true;
+                                std::fprintf(stderr, "glm prefill: grouped WMMA rejected the down shape, MMQ from here\n");
+                            } else {
+                                S->mark("moe_wmma", s);
+                                i0 = i1;
+                                continue;
+                            }
+                        }
+                    }
+                    mmq::quantize(S->x, M.row_tok + r0 + a, M.Xq, Ly.gu_type, E, E, nrows, s);
                     mmq::Product gu;
                     gu.w = wbase + (size_t) i0 * stride;
                     gu.type = Ly.gu_type;
@@ -3046,6 +3187,83 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         "gemm exl3 down");
             }
         };
+        // FP16 EXPERTS (Volta): a quantized expert routed by at least STRATA_GLM_PREFILL_BLAS rows of the chunk is
+        // dequantized to FP16 (llama.cpp's convert.cu) and multiplied by cuBLAS on the FP16 tensor cores - the
+        // 25M-weight decode once an expert, the GEMM at the FP16 rate (~53 TFLOPS from ~200 rows an expert on a V100,
+        // where MMQ has no int8 tensor cores: ~25 TOPS); lighter experts stay on MMQ.  GLM-5.3-Flash on one V100, two
+        // rounds: 27K prompt 39.7 / 39.9 -> 31.7 / 31.8 s, 8K 623 / 621 -> 764 / 764 tok/s, 2K 549 / 548 -> 581 / 568;
+        // KL against MMQ 0.015 (MMQ against itself 0), the target token's log-prob +0.025 (FP16 activations, not q8_1).
+        // Default 128 rows on sm_70 (Turing+ run MMQ on int8 tensor cores: 0 there); 0 = MMQ only.
+        // (per device: a split over a V100 and a newer card keeps MMQ on the newer one)
+        const int blas_rows = [] {
+            static const int env = [] {
+                const char* v = getenv("STRATA_GLM_PREFILL_BLAS");
+                return v ? std::max(0, std::atoi(v)) : -1;
+            }();
+            if (env >= 0) return env;
+#if defined(STRATA_USE_HIP)
+            return 0;   // (MMQ only: the FP16 path is measured on Volta)
+#else
+            static int blas_dev[16] = {};   // rows + 1 per device, 0: not looked at yet
+            int dev = 0;
+            cudaGetDevice(&dev);
+            if (dev < 0 || dev >= 16) dev = 0;
+            if (blas_dev[dev] == 0) {
+                int major = 0, minor = 0;
+                cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+                blas_dev[dev] = (major == 7 && minor == 0 ? 128 : 0) + 1;
+            }
+            return blas_dev[dev] - 1;
+#endif
+        }();
+        const bool use_blas = blas_rows > 0 && !Ly.exl3 && mmq::to_f16_supported(Ly.gu_type) &&
+                              mmq::to_f16_supported(Ly.d_type) && S->w16_elems >= (int64_t) 2 * nff * E + E;
+        const auto run_blas_q = [&](const uint8_t* blob, int a, int nrows, int r0) {
+            namespace x3 = strata::kernels::exl3;
+            const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
+            const int gu_rows = (int) std::max<int64_t>(1, (S->w16_elems - wgu) / E);
+            const int dn_rows = (int) std::max<int64_t>(1, (S->w16_elems - wdn) / nff);
+            const int o = place(r0 + a, nrows);
+            float* GU = M.OUTP + (size_t) o * E;   // 2 * n_ff == n_embd: the expert's own OUTP rows hold its gate/up
+            mmq::to_f16(Ly.gu_type, blob, S->w16, wgu, s);
+            uint16_t* X16 = S->w16 + wgu;
+            for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
+                const int n = std::min(gu_rows, nrows - c0);
+                x3::rows_f16(S->x, E, M.row_tok + r0 + a + c0, n, E, X16, s);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
+                                     X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm q gate/up");
+            }
+            gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+            mmq::to_f16(Ly.d_type, blob + Ly.down_off, S->w16, wdn, s);
+            uint16_t* H16 = S->w16 + wdn;
+            for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
+                const int n = std::min(dn_rows, nrows - c0);
+                x3::rows_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, H16, s);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff, H16,
+                                     CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm q down");
+            }
+        };
+        // in set order: runs of lighter experts through MMQ (run_set over the run), the heavy ones alone through cuBLAS
+        const auto run_set_q = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
+                                   int r0) {
+            for (int i = 0; i < n_exp;) {
+                const int rows = hb[i + 1] - hb[i];
+                if (rows >= blas_rows) {
+                    run_blas_q(wbase + (size_t) i * stride, hb[i], rows, r0);
+                    ++i;
+                } else {
+                    int j = i + 1;
+                    while (j < n_exp && hb[j + 1] - hb[j] < blas_rows) ++j;
+                    run_set(wbase + (size_t) i * stride, j - i, stride, d_bounds + i, hb + i, r0);
+                    i = j;
+                }
+            }
+        };
         // in set order (the window takes the rows in order): runs of light experts to the tensor cores, the rest alone
         const auto run_set_x3 = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                     int r0) {
@@ -3065,6 +3283,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const auto run_any = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                  int r0) {
             if (Ly.exl3) run_set_x3(wbase, n_exp, stride, d_bounds, hb, r0);
+            else if (use_blas) run_set_q(wbase, n_exp, stride, d_bounds, hb, r0);
             else run_set(wbase, n_exp, stride, d_bounds, hb, r0);
         };
         if (2 * nff != E) {
@@ -3698,8 +3917,11 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     if (fast_ == nullptr || tokens.empty()) return false;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())   // (a tail lent to the vision encoder: the
         if (m->pf_ == nullptr || m->fast_ == nullptr || m->vis_lent_) return false;   // token path, until it is back)
-    // a handful of tokens costs less through the token path (the batched path streams every expert they touch)
-    int64_t min_n = 32;
+    // a handful of tokens costs less through the token path (the batched path streams every expert they touch).  One
+    // GPU: from 8 tokens - an agent session's later turns (13.5K of history + a short user turn, Maya-S24 on a V100,
+    // two cooled rounds of three turns): prompt 1,041 / 648 / 521 ms at 32 -> 488 / 405 / 577 at 8 (4: 508 / 397 /
+    // 576, 16: 502 / 716 / 540); a split keeps 32
+    int64_t min_n = split_next_ == nullptr && n_parts_ <= 1 ? 8 : 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if ((int64_t) tokens.size() < min_n) return false;
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt

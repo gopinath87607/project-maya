@@ -374,6 +374,7 @@ struct Glm5Model::FastState {
     size_t scratch_bytes = 0, win_bytes = 0;   // the scratch slots; the verify window's buffers (the VRAM report)
     // activations (device)
     float *x = nullptr, *mixer = nullptr, *ffn = nullptr, *pre = nullptr, *post = nullptr, *comb = nullptr;
+    float* defer_post = nullptr;   // STRATA_GLM_DEFER_CPU: the deferred layer's FFN-side post weights (8 floats)
     float* part = nullptr;
     unsigned int* counter = nullptr;
     void* xq = nullptr;
@@ -683,6 +684,7 @@ struct Glm5Model::FastState {
         int* skip_d = nullptr;
         const volatile int* from = nullptr;
         strata::kernels::SamplerParams pick_sp;
+        int32_t pick_tok[32] = {};          // ... the tokens pushed, by slot (a pick's penalty rows count the drafts before it)
         int64_t p0 = 0;
         int T = 0;
         // STRATA_GLM_WIN_PROF=1: an event after each phase of the window's layers, the gaps summed per phase name
