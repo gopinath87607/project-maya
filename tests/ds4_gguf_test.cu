@@ -922,9 +922,57 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
 
 // the role pairs the tests take: every type as gate / up and as down
 const std::pair<int, int> kQPairs[] = {
-    {gg::iq::kIQ2_XXS, gg::iq::kIQ3_XXS}, {gg::iq::kIQ2_S, gg::iq::kIQ3_S},  {gg::iq::kIQ3_XXS, gg::iq::kIQ3_S},
-    {gg::iq::kIQ4_XS, gg::iq::kQ4_K},     {gg::iq::kQ2_K, gg::iq::kQ3_K},    {gg::iq::kQ4_K, gg::iq::kIQ4_XS},
-    {gg::iq::kQ3_K, gg::iq::kQ2_K},       {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS}, {gg::iq::kIQ3_S, gg::iq::kIQ2_S}};
+    {gg::iq::kIQ2_XXS, gg::iq::kIQ3_XXS}, {gg::iq::kIQ2_XS, gg::iq::kIQ3_XXS}, {gg::iq::kIQ3_XXS, gg::iq::kIQ2_XS},
+    {gg::iq::kIQ2_S, gg::iq::kIQ3_S},     {gg::iq::kIQ3_XXS, gg::iq::kIQ3_S},   {gg::iq::kIQ4_XS, gg::iq::kQ4_K},
+    {gg::iq::kQ2_K, gg::iq::kQ3_K},       {gg::iq::kQ4_K, gg::iq::kIQ4_XS},     {gg::iq::kQ3_K, gg::iq::kQ2_K},
+    {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS},   {gg::iq::kIQ3_S, gg::iq::kIQ2_S}};
+
+// the Engram table's Q6_K rows (ds4_kernels.cu's q6k_value, engram_dequant / engram_dequant_tok fmt 1) against
+// ggml's dequantize_row_q6_K, bit for bit: the rows are random bytes, each block's d a small positive half
+void test_engram_q6(cudaStream_t s) {
+    for (int hd : {256, 512}) {
+        const int cols = 3, T = 2, n = T * cols;
+        const size_t rb = (size_t) (hd / 256) * 210, per = (size_t) cols * (hd + hd / 32);
+        std::vector<uint8_t> rows(rb * (size_t) n);
+        for (auto& v : rows) v = (uint8_t) (rng() & 0xff);
+        for (size_t b = 0; b < rows.size(); b += 210) {
+            const __half d = __float2half(0.001f + 0.002f * std::fabs(frand()));
+            std::memcpy(&rows[b + 208], &d, 2);
+        }
+        std::vector<float> want((size_t) n * hd);
+        for (int r = 0; r < n; ++r)
+            ggml_get_type_traits(GGML_TYPE_Q6_K)->to_float(rows.data() + (size_t) r * rb, want.data() + (size_t) r * hd, hd);
+        uint8_t* dr = dev(rows);
+        float* o1 = nullptr;
+        CU(cudaMalloc(&o1, (size_t) n * hd * 4));
+        strata::ds4::engram_dequant(dr, nullptr, n, hd, o1, s, 1);
+        CU(cudaStreamSynchronize(s));
+        const std::vector<float> got = host(o1, (size_t) n * hd);
+        int bad = 0;
+        for (size_t i = 0; i < got.size(); ++i) bad += got[i] != want[i];
+        if (bad) ++g_fail;
+        char what[96];
+        std::snprintf(what, sizeof(what), "engram Q6_K rows, hd %d", hd);
+        std::printf("%-44s %s  %d of %zu values differ from ggml's\n", what, bad ? "FAIL" : "ok  ", bad, got.size());
+        // the chunk staging (engram_dequant_tok): [token][cols * hd | cols * hd/32], a Q6_K row's bytes first in its slot
+        std::vector<uint8_t> src((size_t) T * per, 0);
+        for (int t = 0; t < T; ++t)
+            for (int c = 0; c < cols; ++c)
+                std::memcpy(src.data() + (size_t) t * per + (size_t) c * hd, rows.data() + (size_t) (t * cols + c) * rb, rb);
+        uint8_t* ds = dev(src);
+        float* o2 = nullptr;
+        CU(cudaMalloc(&o2, (size_t) n * hd * 4));
+        strata::ds4::engram_dequant_tok(ds, per, cols, T, hd, o2, s, 1);
+        CU(cudaStreamSynchronize(s));
+        const std::vector<float> got2 = host(o2, (size_t) n * hd);
+        bad = 0;
+        for (size_t i = 0; i < got2.size(); ++i) bad += got2[i] != want[i];
+        if (bad) ++g_fail;
+        std::snprintf(what, sizeof(what), "engram Q6_K chunk rows, hd %d", hd);
+        std::printf("%-44s %s  %d of %zu values differ from ggml's\n", what, bad ? "FAIL" : "ok  ", bad, got2.size());
+        cudaFree(dr), cudaFree(ds), cudaFree(o1), cudaFree(o2);
+    }
+}
 
 // a token's 6 low-bit experts at full size: GB/s of the weights read
 void bench_q(cudaStream_t s) {
@@ -1568,10 +1616,11 @@ int main(int argc, char** argv) {
     test_kv_pack(s);
     test_mv(s);
     test_experts(512, 256, s);
-    for (int t : {gg::iq::kIQ2_XXS, gg::iq::kIQ2_S, gg::iq::kIQ3_XXS, gg::iq::kIQ3_S, gg::iq::kIQ4_XS, gg::iq::kQ2_K,
-                  gg::iq::kQ3_K, gg::iq::kQ4_K})
+    for (int t : {gg::iq::kIQ2_XXS, gg::iq::kIQ2_XS, gg::iq::kIQ2_S, gg::iq::kIQ3_XXS, gg::iq::kIQ3_S, gg::iq::kIQ4_XS,
+                  gg::iq::kQ2_K, gg::iq::kQ3_K, gg::iq::kQ4_K})
         test_mv_q(t, s);
     for (const auto& pr : kQPairs) test_experts_q(512, 256, pr.first, pr.second, s);
+    test_engram_q6(s);
     if (argc >= 3) {
         test_experts(std::atoi(argv[1]), std::atoi(argv[2]), s);
         for (int i : {0, 4}) test_experts_q(std::atoi(argv[1]), std::atoi(argv[2]), kQPairs[i].first, kQPairs[i].second, s);

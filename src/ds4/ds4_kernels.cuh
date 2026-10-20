@@ -160,11 +160,14 @@ void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, i
 /// A speculative window's rollback: ring[(p0 + t) % n] = backup[t] for keep <= t < T (the rows ext_to_ring replaced).
 void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
 
-/// Engram.  rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].
-void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s);
+/// Engram.  fmt 0: rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].
+/// fmt 1: rows: n Q6_K rows ((hd / 256) blocks of 210 bytes each, its scales inside them; scales unused).
+void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s,
+                    int fmt = 0);
 /// The same over the host's per-token layout (a chunk): token t's cols rows, then their scales, `per` bytes a token;
-/// T tokens -> out F32 [T * cols][hd].
-void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s);
+/// T tokens -> out F32 [T * cols][hd]  (fmt 1: a row's Q6_K bytes at its slot's start).
+void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s,
+                        int fmt = 0);
 /// h[t][k] += gate[t][k] * value[t] with the gate from the normalized dot of h[t][k] * w[k] * key[t][k]
 /// (kv[t] = [key hc x dim | value dim]).
 void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps, cudaStream_t s);

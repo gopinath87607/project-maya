@@ -191,6 +191,12 @@ float f16_to_f32(uint16_t h) {
     std::memcpy(&f, &u, 4);
     return f;
 }
+uint16_t f32_to_bf16(float f) {   // round to nearest even (ggml's ggml_fp32_to_bf16_rne)
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    if ((u & 0x7f800000u) == 0x7f800000u) return (uint16_t) ((u >> 16) | ((u & 0xffffu) ? 1u : 0u));
+    return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
 
 // ------------------------------------------------------------------ the pack
 struct Tensor {
@@ -1149,18 +1155,55 @@ struct Model::Impl {
     // standalone [n][k] matrix
     bool mat_bf16(Dev& d, const std::string& pre, const Tensor& t, x3::Mat& m, std::string& err, size_t* acct, int part,
                   int np, bool cols) {
-        const bool q8 = t.dtype == "Q8_0";
-        if (t.shape.size() != 2 || (q8 && t.shape[1] % 32 != 0)) {
+        const bool q8 = t.dtype == "Q8_0", q6 = t.dtype == "Q6_K";
+        if (t.shape.size() != 2 || (q8 && t.shape[1] % 32 != 0) || (q6 && t.shape[1] % 256 != 0)) {
             err = pre + ": a " + t.dtype + " tensor that is not a matrix";
             return false;
         }
         int n = (int) t.shape[0], k = (int) t.shape[1];
-        // a row's bytes, and the bytes of v of its values (BF16: 2 each; Q8_0: 34 every 32)
+        // a row's bytes, and the bytes of v of its values (BF16: 2 each; Q8_0: 34 every 32; Q6_K: 210 every 256,
+        // decoded to BF16 here - a block's scales interleave its codes, so a part cannot take the file's slice)
         auto bytes_of = [&](size_t v) { return q8 ? v / 32 * gg::kQ8Bytes : v * 2; };
-        std::vector<uint8_t> w((size_t) n * bytes_of((size_t) k));
-        if (t.bytes != w.size() || !pk.read(t, w.data())) {
-            err = pre + ": read failed";
-            return false;
+        std::vector<uint8_t> w;
+        if (q6) {
+            constexpr size_t kB6 = 210;
+            std::vector<uint8_t> raw((size_t) n * (size_t) (k / 256) * kB6);
+            if (t.bytes != raw.size() || !pk.read(t, raw.data())) {
+                err = pre + ": read failed";
+                return false;
+            }
+            w.resize((size_t) n * bytes_of((size_t) k));
+            for (int r = 0; r < n; ++r) {
+                const uint8_t* b = raw.data() + (size_t) r * (size_t) (k / 256) * kB6;
+                uint16_t* y = (uint16_t*) (w.data() + (size_t) r * bytes_of((size_t) k));
+                for (int blk = 0; blk < k / 256; ++blk, b += kB6, y += 256) {
+                    const uint8_t* ql = b, *qh = b + 128;        // ggml's block_q6_K: ql, qh, the 16 int8 scales
+                    const int8_t* sc = (const int8_t*) (b + 192);
+                    const float dd = f16_to_f32((uint16_t) (b[208] | b[209] << 8));
+                    for (int half = 0; half < 2; ++half) {       // 128 values a half (ggml's dequantize_row_q6_K)
+                        const uint8_t* l0 = ql + 64 * half, *h0 = qh + 32 * half;
+                        const int8_t* s0 = sc + 8 * half;
+                        uint16_t* yy = y + 128 * half;
+                        for (int l = 0; l < 32; ++l) {
+                            const int is = l / 16;
+                            const int q1 = (int) ((l0[l] & 0xF) | (((h0[l] >> 0) & 3) << 4)) - 32;
+                            const int q2 = (int) ((l0[l + 32] & 0xF) | (((h0[l] >> 2) & 3) << 4)) - 32;
+                            const int q3 = (int) ((l0[l] >> 4) | (((h0[l] >> 4) & 3) << 4)) - 32;
+                            const int q4 = (int) ((l0[l + 32] >> 4) | (((h0[l] >> 6) & 3) << 4)) - 32;
+                            yy[l] = f32_to_bf16(dd * (float) s0[is + 0] * (float) q1);
+                            yy[l + 32] = f32_to_bf16(dd * (float) s0[is + 2] * (float) q2);
+                            yy[l + 64] = f32_to_bf16(dd * (float) s0[is + 4] * (float) q3);
+                            yy[l + 96] = f32_to_bf16(dd * (float) s0[is + 6] * (float) q4);
+                        }
+                    }
+                }
+            }
+        } else {
+            w.resize((size_t) n * bytes_of((size_t) k));
+            if (t.bytes != w.size() || !pk.read(t, w.data())) {
+                err = pre + ": read failed";
+                return false;
+            }
         }
         if (np > 1) {
             const int whole = cols ? n : k, wd = whole / np;
@@ -1209,7 +1252,8 @@ struct Model::Impl {
     // matrix of its own (the rotations' 128-blocks stay whole)
     bool mat(Dev& d, const std::string& pre, x3::Mat& m, std::string& err, size_t* acct, int part = 0, int np = 1,
              bool cols = true) {
-        if (const Tensor* tw = pk.get(pre + ".weight"); tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0"))
+        if (const Tensor* tw = pk.get(pre + ".weight");
+            tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0" || tw->dtype == "Q6_K"))
             return mat_bf16(d, pre, *tw, m, err, acct, part, np, cols);
         const Tensor* tr = pk.get(pre + ".trellis");
         const Tensor* su = pk.get(pre + ".suh");
@@ -1357,7 +1401,14 @@ struct Model::Impl {
     }
 
     size_t mat_bytes(const std::string& pre) const {
-        if (const Tensor* t = pk.get(pre + ".weight")) return align256(t->bytes);
+        if (const Tensor* t = pk.get(pre + ".weight")) {
+            if (t->dtype == "Q6_K") {   // (mat_bf16 decodes it to BF16 at load: 2 bytes a value)
+                size_t v = 1;
+                for (auto d : t->shape) v *= (size_t) d;
+                return align256(v * 2);
+            }
+            return align256(t->bytes);
+        }
         size_t b = 0;
         for (const char* s : {".trellis", ".suh", ".svh"})
             if (const Tensor* t = pk.get(pre + s)) b += align256(t->bytes);
@@ -1373,7 +1424,7 @@ struct Model::Impl {
     // expert's matrix r at the same stride from expert 0's in one file (the GGUF's [n_exp][out][in] tensor)
     // (the other block types: lay.fmt stays kFmtMXFP4 - read in place as these - and lay.K[r] is role r's ggml type)
     static int gg_type_of(const std::string& dtype) {
-        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 16, 18, 21, 22, 23})
+        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 16, 17, 18, 21, 22, 23})
             if (dtype == gg::type_name(t)) return t;
         return -1;
     }
@@ -4044,6 +4095,11 @@ struct Model::Impl {
     // [hd] codes then the scales; nullptr: h_eg).  eg_issue serves the rows already fetched from the row cache (and a
     // row the window needs twice from one read) and hands the rest to the reader's threads; eg_finish waits for them,
     // copies the repeats and keeps the new rows in the cache.  The rows are the file's bytes either way.
+    // the Engram table's row format (ds4_kernels.cuh's engram_dequant fmt): 0 MXFP8 codes + scales, 1 Q6_K rows
+    int eg_fmt(int li) const {
+        const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
+        return tw != nullptr && tw->dtype == "Q6_K" ? 1 : 0;
+    }
     void eg_issue(int64_t p0, int T, int li, uint8_t* dst, EgBatch& b) {
         const int cols = (pk.eg_ngram - 1) * pk.eg_heads, hd = pk.eg_hd;
         const size_t per = (size_t) cols * (hd + hd / 32);
@@ -4053,6 +4109,9 @@ struct Model::Impl {
         const Tensor* tw = pk.get(P + "weight");
         const Tensor* ts = pk.get(P + "scale");
         const bool mx8 = tw->dtype == "MXFP8";   // (a GGUF: the scales between the codes, one per 32)
+        const bool q6 = tw->dtype == "Q6_K";     // (one block a row: its 16 scales inside it)
+        const size_t rb = q6 ? (size_t) (hd / 256) * 210 : (size_t) hd;   // a column's payload bytes in its slot
+        const size_t sb = q6 ? 0 : (size_t) (hd / 32);                    // ... and its scale bytes after them
         std::unordered_map<uint64_t, int> first;   // a row this batch reads already -> its read
         int64_t hits = 0;
         {
@@ -4082,8 +4141,8 @@ struct Model::Impl {
                         uint8_t* sd = scales + (size_t) c * (hd / 32);
                         const uint64_t key = (uint64_t) id * 8 + (uint64_t) li;
                         if (const uint8_t* hit = eg_cache.find(key)) {
-                            std::memcpy(rd, hit, (size_t) hd);
-                            std::memcpy(sd, hit + hd, (size_t) hd / 32);
+                            std::memcpy(rd, hit, rb);
+                            if (sb != 0) std::memcpy(sd, hit + hd, sb);
                             ++hits;
                             continue;
                         }
@@ -4102,6 +4161,10 @@ struct Model::Impl {
                             r.mx8 = true;
                             r.n = (uint32_t) (hd / 32 * 33);
                             r.off = tw->off + (uint64_t) id * r.n;
+                        } else if (q6) {
+                            r.n = (uint32_t) rb;
+                            r.off = tw->off + (uint64_t) id * rb;
+                            r.scales = nullptr;
                         } else {
                             r.n = (uint32_t) hd;
                             r.off = tw->off + (uint64_t) id * hd;
@@ -4127,23 +4190,26 @@ struct Model::Impl {
         int want = 0;
         if (b.post.compare_exchange_strong(want, 1, std::memory_order_acq_rel)) {
             const int hd = pk.eg_hd;
+            // (r.n / r.n2 are the read's sizes: an mx8 row's packed bytes deinterleave to hd codes and hd/32 scales)
+            auto n_codes = [&](const EgRead& r) { return r.mx8 ? (size_t) hd : (size_t) r.n; };
+            auto n_scales = [&](const EgRead& r) { return r.mx8 ? (size_t) (hd / 32) : (size_t) r.n2; };
             for (const auto& d : b.dups) {
                 const EgRead& r = b.reads[(size_t) d.first];
-                std::memcpy(d.second.first, r.dst, (size_t) hd);
-                std::memcpy(d.second.second, r.scales, (size_t) hd / 32);
+                std::memcpy(d.second.first, r.dst, n_codes(r));
+                if (n_scales(r) != 0) std::memcpy(d.second.second, r.scales, n_scales(r));
             }
             {
                 std::lock_guard<std::mutex> lk(eg_cache_mu);
                 for (size_t i = 0; i < b.reads.size(); ++i) {
                     const EgRead& r = b.reads[i];
                     if (!b.ok[i]) {   // (a failed read: zeros, its gate adds nothing; not kept)
-                        std::memset(r.dst, 0, (size_t) hd);
-                        std::memset(r.scales, 0, (size_t) hd / 32);
+                        std::memset(r.dst, 0, n_codes(r));
+                        if (n_scales(r) != 0) std::memset(r.scales, 0, n_scales(r));
                         continue;
                     }
                     if (uint8_t* c = eg_cache.put(r.key)) {
-                        std::memcpy(c, r.dst, (size_t) hd);
-                        std::memcpy(c + hd, r.scales, (size_t) hd / 32);
+                        std::memcpy(c, r.dst, n_codes(r));
+                        if (n_scales(r) != 0) std::memcpy(c + hd, r.scales, n_scales(r));
                     }
                 }
             }
@@ -5344,12 +5410,13 @@ struct Model::Impl {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
             const size_t per = (size_t) cols * (ehd + ehd / 32);
             const int slot = wp.k % 2;   // (read ahead by run_dev_chunks: two chunks' in flight)
+            const int efmt = eg_fmt(l.eg);
             uint8_t* host = c.eg_host[slot] + (size_t) l.eg * c.C * per;
             CK(cudaMemcpyAsync(c.eg_rows, host, (size_t) T * per, cudaMemcpyHostToDevice, s));
             CK(cudaEventRecord(c.eg_ev[slot], s));
             for (int s0 = 0; s0 < T; s0 += 256) {
                 const int ns = std::min(256, T - s0);
-                engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s);
+                engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s, efmt);
                 x3::rows_f16(c.eg_x, cols * ehd, nullptr, ns, cols * ehd, c.eg_x16, s);
                 if (!gemm(d, c, l.eg_wkv, c.eg_x16, cols * ehd, ns, c.eg_kv, (H + 1) * D, 0.0f, err)) return false;
                 engram_gate(c.h + (size_t) s0 * H * D, c.eg_kv, l.eg_w, H, D, ns, g.eps, s);
@@ -6638,14 +6705,21 @@ struct Model::Impl {
             const size_t per = (size_t) cols * (ehd + ehd / 32);
             eg_finish(*eg_win[(size_t) l.eg]);   // (asked for when the window began)
             uint8_t* src = h_eg + (size_t) l.eg * eg_cap * per;
-            for (int t = 0; t < T; ++t)   // [token][rows | scales] -> [all rows][all scales]
-                CK(cudaMemcpyAsync(d.eg_rows + (size_t) t * cols * ehd, src + (size_t) t * per, (size_t) cols * ehd,
-                                   cudaMemcpyHostToDevice, s));
-            uint8_t* sc = d.eg_rows + (size_t) T * cols * ehd;
-            for (int t = 0; t < T; ++t)
-                CK(cudaMemcpyAsync(sc + (size_t) t * cols * (ehd / 32), src + (size_t) t * per + (size_t) cols * ehd,
-                                   (size_t) cols * (ehd / 32), cudaMemcpyHostToDevice, s));
-            engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s);
+            const int efmt = eg_fmt(l.eg);
+            uint8_t* sc = nullptr;
+            if (efmt == 1) {
+                const size_t rb = (size_t) (ehd / 256) * 210;   // a column's Q6_K bytes, the slot's first ones
+                CK(cudaMemcpy2DAsync(d.eg_rows, rb, src, (size_t) ehd, rb, (size_t) T * cols, cudaMemcpyHostToDevice, s));
+            } else {
+                for (int t = 0; t < T; ++t)   // [token][rows | scales] -> [all rows][all scales]
+                    CK(cudaMemcpyAsync(d.eg_rows + (size_t) t * cols * ehd, src + (size_t) t * per, (size_t) cols * ehd,
+                                       cudaMemcpyHostToDevice, s));
+                sc = d.eg_rows + (size_t) T * cols * ehd;
+                for (int t = 0; t < T; ++t)
+                    CK(cudaMemcpyAsync(sc + (size_t) t * cols * (ehd / 32), src + (size_t) t * per + (size_t) cols * ehd,
+                                       (size_t) cols * (ehd / 32), cudaMemcpyHostToDevice, s));
+            }
+            engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, efmt);
             if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
         }
