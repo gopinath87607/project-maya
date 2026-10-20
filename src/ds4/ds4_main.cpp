@@ -70,7 +70,7 @@ void usage() {
                  "           [--no-expert-lend] [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--prefill-chunk-max N0,N1,...]\n"
                  "           [--dspark on|off|none] [--dspark-conf F]\n"
-                 "           [--vision on|off] [--mmap-experts on|off|auto]\n"
+                 "           [--vision on|off] [--mmap-experts on|off|auto] [--ram-resident]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
 }
@@ -578,7 +578,8 @@ int main(int argc, char** argv) {
         else if (a == "--mmap-experts") {
             const std::string v = val("--mmap-experts");
             o.mmap_experts = v == "on" ? 1 : v == "off" ? 0 : -1;
-        } else if (a == "--images") images = val("--images");
+        } else if (a == "--ram-resident") o.mmap_experts = 0;   // every CPU-lane expert copied into RAM (as --mmap-experts off)
+        else if (a == "--images") images = val("--images");
         else if (a == "--encode-image") enc_rgb = val("--encode-image");
         else if (a == "--dump-image") enc_out = val("--dump-image");
         else if (a == "--size") {
