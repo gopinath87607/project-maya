@@ -260,10 +260,9 @@
             <span class="card-title">The split, card by card</span>
             <span class="muted small" id="gpus-sub"></span>
           </div>
+          <div class="miblegend" id="gpus-legend" hidden></div>
           <div class="gpus-list" id="gpus-list"></div>
-          <p class="muted small gpus-note">Each card as the engine reports it: the layers on it, the experts it holds for
-            good, the drafter's and the trunk's slots its prompt arena lends between prompts, and the chunk its prompt
-            path takes. The page sums whatever the engine reports.</p>
+          <p class="muted small gpus-note" id="gpus-note"></p>
         </div>
 
         <!-- the GPUs: what fills each (the GLM engine's VRAM lines and NVML's processes) and, with several, each one's load,
@@ -290,10 +289,9 @@
             <span class="muted small" id="lend-sub"></span>
           </div>
           <div class="metrics metrics--tiers metrics--four" id="lend-metrics"></div>
+          <div class="miblegend" id="lend-legend" hidden></div>
           <div class="lend-rows" id="lend-rows"></div>
-          <p class="muted small lend-note">While the model reads a prompt its expert banks are lent back to the prompt:
-            the same bytes are the chunk buffers, then experts again. The engine's own report, summed over whatever
-            cards it found.</p>
+          <p class="muted small lend-note" id="lend-note"></p>
         </div>
       </div>
 
@@ -306,6 +304,7 @@
           </div>
           <div class="metrics metrics--tiers metrics--four" id="prefill-metrics"></div>
           <div class="table-wrap" id="prefill-chunks"></div>
+          <div class="miblegend" id="prefill-legend" hidden></div>
           <p class="muted small prefill-note" id="prefill-note"></p>
         </div>
       </div>

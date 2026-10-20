@@ -537,11 +537,13 @@ body:not([data-tab="chat"]) .chats__search, body:not([data-tab="chat"]) .chats__
 .gpus-note, .lend-note, .prefill-note, .storage-note, .engram-note, .draft-note { margin: 0; line-height: 1.45; }
 
 /* a card's bar: a part a hue (the same hues the GPU map's bars use), the widths the bytes; free stays the bare track */
-.mibbar { display: flex; height: 18px; gap: 2px; border-radius: 6px; overflow: hidden; background: var(--st-surface-3);
-          --mb-weights: #2a78d6; --mb-pool: var(--st-accent); --mb-lend: #1baf7a; --mb-mtp: #e87ba4;
-          --mb-prompt: #eda100; --mb-spare: color-mix(in srgb, var(--st-ink-muted) 30%, var(--st-surface-3));
-          --mb-free: transparent; }
-[data-theme="dark"] .mibbar { --mb-weights: #3987e5; --mb-lend: #199e70; --mb-mtp: #d55181; --mb-prompt: #c98500; }
+.mibbar { display: flex; height: 18px; gap: 2px; border-radius: 6px; overflow: hidden; background: var(--st-surface-3); }
+/* the hues, shared by the bars and the key that names them (mibLegend renders .miblegend) */
+.mibbar, .miblegend { --mb-weights: #2a78d6; --mb-pool: var(--st-accent); --mb-lend: #1baf7a; --mb-mtp: #e87ba4;
+                      --mb-prompt: #eda100; --mb-spare: color-mix(in srgb, var(--st-ink-muted) 30%, var(--st-surface-3));
+                      --mb-free: transparent; }
+[data-theme="dark"] .mibbar, [data-theme="dark"] .miblegend {
+  --mb-weights: #3987e5; --mb-lend: #199e70; --mb-mtp: #d55181; --mb-prompt: #c98500; }
 .mibbar__seg { display: block; height: 100%; min-width: 2px; flex: 0 1 0; border-radius: 3px;
                background: var(--mb-free); transition: flex-grow 400ms var(--st-ease); }
 .mibbar__seg[data-k="weights"] { background: var(--mb-weights); }
@@ -552,10 +554,23 @@ body:not([data-tab="chat"]) .chats__search, body:not([data-tab="chat"]) .chats__
 .mibbar__seg[data-k="spare"] { background: var(--mb-spare); }
 .mibbar__seg[data-k="free"] { background: transparent; min-width: 0; }
 
+/* the key: a swatch, its name (and its MiB over the cards), and a sentence on what that memory is */
+.miblegend { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: var(--st-s-2) var(--st-s-5);
+             margin-top: var(--st-s-2); font-size: var(--st-fs-sm); }
+.miblegend[hidden] { display: none; }
+.miblegend__item { display: grid; grid-template-columns: 10px minmax(0, 1fr); column-gap: 8px; row-gap: 1px;
+                   align-items: center; }
+.miblegend__name { color: var(--st-ink); font-weight: 550; }
+.miblegend__name b { color: var(--st-ink-muted); font-weight: 600; font-variant-numeric: tabular-nums; }
+.miblegend__sub { grid-column: 2; font-size: var(--st-fs-xs); color: var(--st-ink-muted); line-height: 1.35; }
+.miblegend .dot { background: var(--mb-c); flex: none; }
+.miblegend .dot--free { background: transparent; box-shadow: inset 0 0 0 1.5px var(--st-ink-muted); }
+
 @media (max-width: 760px) {
   .gpu-line, .lend-row { grid-template-columns: minmax(0, 1fr) auto; }
   .gpu-line .mibbar, .lend-row .mibbar { grid-column: 1 / -1; }
   .lend-rows, .gpus-list { gap: var(--st-s-4); }
+  .miblegend { grid-template-columns: minmax(0, 1fr); gap: var(--st-s-2); }
 }
 
 /* the live number each view carries in its tab (the engine's own facts, summed) */

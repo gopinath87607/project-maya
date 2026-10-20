@@ -457,6 +457,41 @@ function mibBar(parts, total) {
     parts.filter((p) => p.v > 0).map((p) => `<span class="mibbar__seg" data-k="${esc(p.k)}" style="flex-grow:${(p.v / t).toFixed(4)}"></span>`).join("") +
     `</div>`;
 }
+// what each colour of a bar is; every key is drawn from this, so a colour is never left unexplained
+const MIB_PARTS = {
+  weights: {label: "Model weights + caches", sub: "the trunk's dense tensors and the attention caches on this card; fixed, never lent"},
+  pool:    {label: "Permanent experts", sub: "expert banks the card holds through both phases, outside the arena"},
+  lend:    {label: "Lent trunk experts", sub: "trunk experts the decoder borrows into the arena while it answers"},
+  mtp:     {label: "Drafter (DSpark)", sub: "the draft block's expert banks, in the arena while answering"},
+  spare:   {label: "Arena spare", sub: "arena bytes neither the trunk nor the drafter uses right now"},
+  prompt:  {label: "Prompt buffers", sub: "the chunk buffers a prompt is read through; the decoder gets these bytes back after it"},
+  free:    {label: "Free", sub: "VRAM no pool holds: the reserve kept for the driver and the display"},
+};
+// the key above a panel's bars: a swatch, its name (and its MiB over the cards) and a sentence on what it is
+function mibLegend(el, items) {
+  el.innerHTML = items.map(({k, v}) => {
+    const d = MIB_PARTS[k];
+    return `<div class="miblegend__item"><i class="dot${k === "free" ? " dot--free" : ""}" style="--mb-c:var(--mb-${k})"></i>` +
+      `<span class="miblegend__name">${esc(d.label)}${v ? ` <b>${esc(v)}</b>` : ""}</span>` +
+      `<span class="miblegend__sub">${esc(d.sub)}</span></div>`;
+  }).join("");
+  el.hidden = !items.length;
+}
+// the parts both expert panels share, with each part's MiB summed over the cards (the phase's own set)
+function mibPartsFor(gs, phase) {
+  const sum = (f) => gs.reduce((a, g) => a + (f(g) || 0), 0);
+  const arena = sum((g) => g.arena || 0), lend = sum((g) => g.lend_mib || 0), mtp = sum((g) => g.mtp_mib || 0);
+  const items = [{k: "weights", v: `${fmt(sum((g) => (g.weights || 0) + (g.caches || 0)))} MiB`},
+                 {k: "pool", v: `${fmt(sum((g) => g.perm_mib || 0))} MiB`}];
+  if (phase === 1) {
+    items.push({k: "lend", v: `${fmt(lend)} MiB`}, {k: "mtp", v: `${fmt(mtp)} MiB`},
+               {k: "spare", v: `${fmt(Math.max(0, arena - lend - mtp))} MiB`});
+  } else {
+    items.push({k: "prompt", v: `${fmt(arena)} MiB`});
+  }
+  items.push({k: "free", v: `${fmt(sum((g) => g.free || 0))} MiB`});
+  return items;
+}
 function gpuOf(m, g) {   // NVML's reading of the card the engine reported (joined on its bus id; else its order)
   const cards = (m.hardware || {}).gpus || [];
   return (g.pci && cards.find((c) => c.pci === g.pci)) || cards[g.dev] || null;
@@ -504,6 +539,12 @@ function renderGpuPanel(m) {
       <div class="gpu-line__nums"><b>${fmt(held)} experts</b><span>${fmt(g.free)} MiB free${g.chunk ? ` · chunk ${fmt(g.chunk)}` : ""}</span></div>
     </div>`;
   }).join("");
+  mibLegend($("gpus-legend"), mibPartsFor(gs, phase));
+  $("gpus-note").textContent = "Each bar is one card's whole VRAM on that card's own scale: a coloured length is MiB of " +
+    "that memory, and the numbers at the right are the expert slots it holds (permanent + borrowed) and its free MiB. " +
+    "The same bytes change colour with the phase — while a prompt is read the arena is the orange chunk buffers; while " +
+    "the model answers it is teal trunk experts and pink drafter slots. Card totals: " +
+    gs.map((g) => `GPU ${g.dev} ${fmt(g.total)} MiB`).join(" · ") + ".";
 }
 
 // Loan: the arena's experts between prompts (the engine's LEND lines and its last refill)
@@ -525,13 +566,14 @@ function renderLendPanel(m) {
                                                     : "the prompt holds the arenas now");
   if (num(stat.lend_n) != null) {
     setCard("lend-refill", fmt(stat.lend_n), " experts",
-            `${fmt(stat.lend_gb, 2)} GB in ${fmt(stat.lend_ms)} ms` + (phase === 1 ? "" : " · before this prompt"));
+            `${fmt(stat.lend_gb, 2)} GB in ${fmt(stat.lend_ms)} ms`);
   } else {
     setCard("lend-refill", null, "", "no refill yet - the first answer fills the arenas");
   }
   const arenaGb = arena / 1024;
-  setCard("lend-arena", fmt(arenaGb, 2), " GB", `${fmt(arenaMib)} MiB of expert slots`);
-  setCard("lend-perm", fmt(perm), " experts", "held on the cards for good (outside the arena)");
+  setCard("lend-arena", fmt(arenaGb, 2), " GB",
+          phase === 1 ? `${fmt(arenaMib)} MiB of expert slots` : `${fmt(arena)} MiB of prompt buffers`);
+  setCard("lend-perm", fmt(perm), " experts", "held through both phases, outside the arena");
   spark("lend-refill-p", (hist.lend_n || []).map((x) => x || 0), Math.max(1, stat.lend_n || 0));
   spark("lend-now-p", (hist.phase || []).map((x) => (x ? 1 : 0)), 1);
   $("lend-sub").textContent = `${gs.length} GPU${gs.length > 1 ? "s" : ""} · ${fmt(lend + mtp)} slots the arenas add while decoding`;
@@ -547,19 +589,27 @@ function renderLendPanel(m) {
                   phase === 1 ? {k: "spare", v: Math.max(0, (g.arena || 0) - ex), label: "arena spare"} : null,
                   {k: "free", v: g.free || 0, label: "free"}].filter(Boolean);
     return `<div class="lend-row">
-      <div class="lend-row__name"><b>GPU ${esc(g.dev)}</b><span>${esc(name || "")}</span></div>
+      <div class="lend-row__name"><b>GPU ${esc(g.dev)}</b><span>${esc([name, layersOf(g, gs)].filter(Boolean).join(" · "))}</span></div>
       ${mibBar(segs, g.total)}
       <div class="lend-row__nums"><b>${fmt(g.perm)} + ${fmt((g.lend || 0) + (g.mtp || 0))}</b>
-        <span>perm + lent · arena ${fmt((g.arena || 0) / 1024, 2)} GB</span></div>
+        <span>perm + ${phase === 1 ? "lent now" : "lent when decoding"} · arena ${fmt((g.arena || 0) / 1024, 2)} GB</span></div>
     </div>`;
   }).join("");
+  mibLegend($("lend-legend"), mibPartsFor(gs, phase));
+  $("lend-note").textContent = "The arena is the same bytes twice: while a prompt is read they are its orange chunk " +
+    "buffers; when the prompt ends the decoder borrows them back as expert slots — teal for the trunk, pink for the " +
+    "drafter — and fills them from the last refill (its experts, the GB of weights copied, the ms it took). GB on this " +
+    "tab is bytes of VRAM summed over the cards; \"perm + lent\" under a bar is that card's experts held in both phases plus " +
+    "the slots its arena adds when the model answers.";
 }
 
 // Prefill: the engine's chunk per card, its path and the rate it read at
 function renderPrefillPanel(m) {
   const card = $("prefill-card"), gs = bigFirst(m.lend || []), eng = m.engine || {}, stat = (m.tiers || {}).now || {};
   const live = m.live || {}, hist = (m.history || {}), last = (m.requests || [])[0];
-  const chunks = gs.filter((g) => (g.chunk || 0) > 0);
+  // the pipeline's own order: layer 0's card first, whatever the cards' sizes (the GPU and Loan tabs keep big card first)
+  const start = (g) => { const L = g.layers || []; return L.length ? L[0] : 1e9; };
+  const chunks = gs.filter((g) => (g.chunk || 0) > 0).slice().sort((a, b) => start(a) - start(b));
   if (!chunks.length && !(num(+eng.prefill_chunk) > 0)) { card.hidden = true; return; }
   card.hidden = false;
   const rate = live.state !== "idle" ? live.prefill_tok_s_mean
@@ -597,11 +647,14 @@ function renderPrefillPanel(m) {
     chunks.map((g) => `<tr><td>GPU ${esc(g.dev)}</td><td>${stage(g)}</td><td>${esc(gpuNameCls(gpuOf(m, g)) || "–")}</td>
       <td>${layersOf(g, gs) || "–"}</td>
       <td class="num">${fmt(g.chunk)} tokens</td></tr>`).join("") + `</tbody></table>` : "";
+  mibLegend($("prefill-legend"), [{k: "prompt"}, {k: "lend"}, {k: "mtp"}]);
   $("prefill-note").textContent = chunks.length
-    ? "Layers are the model's 40 trunk blocks; a prompt passes through them in stage order (GPU 0's layers 0–9 first, " +
-      "GPU 3's 30–39 last). Rows are biggest card first, so Stage gives the pipeline's order. Each card's buffers are " +
-      "sized by --prefill-chunk-max: longer chunks read each expert once a prompt instead of twice, but take VRAM the " +
-      "expert banks would otherwise hold."
+    ? "Rows follow the pipeline: a prompt walks the trunk blocks in layer order — here GPU 0's 0–9 first and GPU 3's " +
+      "30–39 last — and Stage is the card's place in that order (1, 2, 3, 4 here). Chunk is how many prompt tokens that card reads per pass " +
+      "(--prefill-chunk-max): a length of text, not memory. Bigger chunks read each expert once a prompt instead of " +
+      "twice, but take VRAM the expert banks would otherwise hold. The colour key is those same bytes on the GPUs and " +
+      "Loan tabs: orange is these chunk buffers while a prompt is read; teal and pink are what the decoder swaps into " +
+      "the same bytes afterwards."
     : "";
 }
 
