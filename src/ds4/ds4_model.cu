@@ -496,6 +496,13 @@ struct Dev {
     // ever overlaps another's: the arena's offsets are laid out once, after place_experts decides who lends.
     uint8_t* arena = nullptr;
     size_t arena_bytes = 0, arena_off = 0;
+    // the arena's carve layout: each buffer's [off, off + total) bytes, of which a prompt of T rows touches only the
+    // first fixed + per_row*T (a buffer carved with the defaults: all of it, at any T).  enter_prefill gives the prompt
+    // exactly those ranges, so a lend bank lying wholly in a buffer's unused tail can stay filled.
+    struct ArenaSpan {
+        size_t off = 0, total = 0, fixed = 0, per_row = 0;
+    };
+    std::vector<ArenaSpan> arena_spans;
     // a window's scratch, rows of up to kWin tokens (the routed experts' rows: kWin * kPicks)
     float *h = nullptr, *h2 = nullptr, *x = nullptr, *qr = nullptr, *q = nullptr, *kvr = nullptr, *ckr = nullptr,
           *cgr = nullptr, *latent = nullptr, *ikr = nullptr, *iq = nullptr, *iw = nullptr, *scores = nullptr,
@@ -680,6 +687,9 @@ struct Layer {
     int n_perm = 0, n_lend = 0;
     uint8_t* lend_base = nullptr;
     bool lend = false;                          // its banks are in the arena: emptied before a prompt, filled after it
+    // the lend slots a prompt kept (their bytes lay wholly in the chunk buffers' unused tails): (expert, slot), hidden
+    // from the prompt's slot map and put back after it - exit_prefill refills only the ones the prompt took
+    std::vector<std::pair<int, int>> lend_keep;
     std::vector<int> slot;                      // expert -> VRAM slot or -1
     std::vector<int> ram;                       // expert -> RAM-tier slot or -1 (a GGUF's in-place experts; empty: none)
     std::vector<uint8_t*> host;                 // expert -> host (non-null: on the CPU lane; its halves in hh)
@@ -1263,8 +1273,10 @@ struct Model::Impl {
 
     // the prompt arena's carve: dalloc's device part, out of the device's one arena instead of a cudaMalloc.
     // The sizing pass (no arena yet) only adds the bytes; the carving pass takes them, zeroed, at 256-byte boundaries.
+    // fixed/per_row (elements) say what a prompt of T rows touches of the buffer: fixed + per_row*T - a row-major
+    // buffer passes its per-token stride, one every prompt uses whole leaves the default (fixed = (size_t)-1: all).
     template <class T>
-    bool carve(Dev& d, T*& p, size_t n, std::string& err) {
+    bool carve(Dev& d, T*& p, size_t n, std::string& err, size_t fixed = (size_t) -1, size_t per_row = 0) {
         const size_t b = align256(n * sizeof(T));
         if (d.arena == nullptr) {   // (sizing: the arena is cudaMalloc'd to exactly this many bytes)
             d.arena_bytes += b;
@@ -1277,6 +1289,10 @@ struct Model::Impl {
             return false;
         }
         void* v = d.arena + d.arena_off;
+        if (fixed == (size_t) -1)   // the whole buffer, at any row count
+            d.arena_spans.push_back({d.arena_off, b, b, 0});
+        else
+            d.arena_spans.push_back({d.arena_off, b, align256(std::min(n, fixed) * sizeof(T)), per_row * sizeof(T)});
         d.arena_off += b;
         cudaSetDevice(d.id);
         if (cudaMemsetAsync(v, 0, b, d.st) != cudaSuccess || cudaStreamSynchronize(d.st) != cudaSuccess) {
@@ -2768,31 +2784,43 @@ struct Model::Impl {
         const int nm = (int) groups[(size_t) d.grp].mem.size();
         const int NHL = g.heads / nm, HQ = NHL * HD, OG = g.o_groups / nm, FF = g.ff / nm;
         const size_t C = (size_t) c.C, A = (size_t) c.A, AI = (size_t) c.AI, ss = (size_t) o.max_context + 64;
-        bool ok = carve(d, c.h, C * H * D, err) && carve(d, c.x, C * D, err) && carve(d, c.acc, C * D, err) &&
-                  carve(d, c.x16, C * D, err) && carve(d, c.qr, C * g.q_lora, err) &&
-                  carve(d, c.qr16, C * g.q_lora, err) && carve(d, c.kvr, C * HD, err) &&
-                  carve(d, c.ckr, C * HD, err) && carve(d, c.cgr, C * HD, err) &&
-                  carve(d, c.latent, (C + 2) * HD, err) && carve(d, c.lat16, (C + 2) * HD, err) &&
-                  carve(d, c.ikr, (C + 2) * g.ix_hd, err) && carve(d, c.ext, ((size_t) g.win + C) * HD, err) &&
+        if (d.arena != nullptr) d.arena_spans.clear();   // (the carving pass records it; the sizing pass has no arena)
+        // row-major buffers take the prompt's T rows at their start: 0 + per-token stride * T (the context-wide ones -
+        // scores, bm - and the fixed-batch ones - q, o, iq - stay whole: nothing is read past what is zeroed)
+        bool ok = carve(d, c.h, C * H * D, err, 0, (size_t) H * D) && carve(d, c.x, C * D, err, 0, (size_t) D) &&
+                  carve(d, c.acc, C * D, err, 0, (size_t) D) && carve(d, c.x16, C * D, err, 0, (size_t) D) &&
+                  carve(d, c.qr, C * g.q_lora, err, 0, (size_t) g.q_lora) &&
+                  carve(d, c.qr16, C * g.q_lora, err, 0, (size_t) g.q_lora) &&
+                  carve(d, c.kvr, C * HD, err, 0, (size_t) HD) && carve(d, c.ckr, C * HD, err, 0, (size_t) HD) &&
+                  carve(d, c.cgr, C * HD, err, 0, (size_t) HD) &&
+                  carve(d, c.latent, (C + 2) * HD, err, 2 * (size_t) HD, (size_t) HD) &&
+                  carve(d, c.lat16, (C + 2) * HD, err, 2 * (size_t) HD, (size_t) HD) &&
+                  carve(d, c.ikr, (C + 2) * g.ix_hd, err, 2 * (size_t) g.ix_hd, (size_t) g.ix_hd) &&
+                  carve(d, c.ext, ((size_t) g.win + C) * HD, err, (size_t) g.win * HD, (size_t) HD) &&
                   carve(d, c.q, A * HQ, err) && carve(d, c.o, A * HQ, err) && carve(d, c.o16, A * HQ, err) &&
                   carve(d, c.oa, A * OG * g.o_lora, err) && carve(d, c.oa16, A * OG * g.o_lora, err) &&
-                  carve(d, c.iq, AI * g.ix_heads * g.ix_hd, err) && carve(d, c.iw, C * 64, err) &&
+                  carve(d, c.iq, AI * g.ix_heads * g.ix_hd, err) && carve(d, c.iw, C * 64, err, 0, 64) &&
                   carve(d, c.scores, AI * ss, err) && carve(d, c.bm, AI * bm_stride(), err) &&
-                  carve(d, c.topk, C * topk_stride(), err) && carve(d, c.cand, C * cand_stride(), err) &&
-                  carve(d, c.mix, C * 32, err) && carve(d, c.a_pre, C * 8, err) && carve(d, c.a_post, C * 8, err) &&
-                  carve(d, c.a_comb, C * 64, err) && carve(d, c.f_pre, C * 8, err) &&
-                  carve(d, c.f_post, C * 8, err) && carve(d, c.f_comb, C * 64, err) && carve(d, c.pre, C * 8, err) &&
-                  carve(d, c.glog, C * 1024, err) && carve(d, c.ridx, C * kPicks, err) &&
-                  carve(d, c.rw, C * kPicks, err) && carve(d, c.bounds, 2048, err) &&
-                  carve(d, c.row_tok, C * kPicks, err) && carve(d, c.pos, C * kPicks, err) &&
-                  carve(d, c.sg, C * FF, err) && carve(d, c.su, C * FF, err) && carve(d, c.sh16, C * FF, err) &&
-                  carve(d, c.h16, C * FF, err) && carve(d, c.y, C * D, err) && carve(d, c.w16, c.w16_elems, err);
+                  carve(d, c.topk, C * topk_stride(), err, 0, (size_t) topk_stride()) &&
+                  carve(d, c.cand, C * cand_stride(), err, 0, (size_t) cand_stride()) &&
+                  carve(d, c.mix, C * 32, err, 0, 32) && carve(d, c.a_pre, C * 8, err, 0, 8) &&
+                  carve(d, c.a_post, C * 8, err, 0, 8) && carve(d, c.a_comb, C * 64, err, 0, 64) &&
+                  carve(d, c.f_pre, C * 8, err, 0, 8) && carve(d, c.f_post, C * 8, err, 0, 8) &&
+                  carve(d, c.f_comb, C * 64, err, 0, 64) && carve(d, c.pre, C * 8, err, 0, 8) &&
+                  carve(d, c.glog, C * 1024, err, 0, 1024) &&
+                  carve(d, c.ridx, C * kPicks, err, 0, (size_t) kPicks) &&
+                  carve(d, c.rw, C * kPicks, err, 0, (size_t) kPicks) && carve(d, c.bounds, 2048, err) &&
+                  carve(d, c.row_tok, C * kPicks, err, 0, (size_t) kPicks) &&
+                  carve(d, c.pos, C * kPicks, err, 0, (size_t) kPicks) &&
+                  carve(d, c.sg, C * FF, err, 0, (size_t) FF) && carve(d, c.su, C * FF, err, 0, (size_t) FF) &&
+                  carve(d, c.sh16, C * FF, err, 0, (size_t) FF) && carve(d, c.h16, C * FF, err, 0, (size_t) FF) &&
+                  carve(d, c.y, C * D, err, 0, (size_t) D) && carve(d, c.w16, c.w16_elems, err);
         if (!ok) return false;
-        if (has_first && !carve(d, c.emb, C * D, err)) return false;
+        if (has_first && !carve(d, c.emb, C * D, err, 0, (size_t) D)) return false;
         if (has_eg) {
             const size_t ES = 256, per = (size_t) cols * (ehd + ehd / 32);
             if (!carve(d, c.eg_x, ES * cols * ehd, err) || !carve(d, c.eg_x16, ES * cols * ehd, err) ||
-                !carve(d, c.eg_kv, ES * (H + 1) * D, err) || !carve(d, c.eg_rows, C * per, err))
+                !carve(d, c.eg_kv, ES * (H + 1) * D, err) || !carve(d, c.eg_rows, C * per, err, 0, per))
                 return false;
         }
         if (stride > 0 && !carve(d, c.ring, (size_t) c.ring_n * stride, err)) return false;
@@ -5496,11 +5524,16 @@ struct Model::Impl {
         }
     }
 
+    // the chunk kernels tile rows (up to a few hundred); a prompt of T rows may touch a little past T, so every
+    // row-major buffer's used range is rounded up this many rows - those bytes stay zero, as load left them
+    static constexpr int64_t kPrefillRowGuard = 512;
+
     // ---- the phase switch.  A run of chunks takes the arena for its buffers: the experts lent into it go back to the
-    // CPU lane's source (the files - lane_file), the perm bank's spare comes home, the arena is zeroed as it was at
-    // load.  After the run the hottest experts the arena holds fill it again.  Both are idempotent; the model's own
-    // thread alone calls them, between runs
-    bool enter_prefill(std::string& err) {
+    // CPU lane's source (the files - lane_file), the perm bank's spare comes home, the bytes the run uses are zeroed
+    // as they were at load.  A bank lying wholly in the buffers' unused tails stays (a prompt of `rows` rows uses only
+    // each buffer's first rows), hidden from the prompt's slot map; the refill after the run fills only what went.
+    // Both are idempotent; the model's own thread alone calls them, between runs
+    bool enter_prefill(int64_t rows, std::string& err) {
         if (phase.load(std::memory_order_acquire) == 0) return true;
         // the cache's moves write into the arena's slots: apply the ones finished, start none, wait for the rest
         draining.store(true, std::memory_order_release);
@@ -5526,7 +5559,30 @@ struct Model::Impl {
         phase.store(0, std::memory_order_release);
         st.phase = 0;
         sync_devs();
-        int64_t gone = 0;
+        // the arena's used ranges for this run: every carved buffer's first fixed + per_row*(rows + guard) bytes.  A
+        // chunk touches no byte outside them, so a lend bank wholly inside the rest is kept (and its expert hidden
+        // from the prompt's slot map: the prompt must not take it for a resident one)
+        std::vector<std::vector<std::array<size_t, 2>>> used(devs.size());
+        for (size_t di = 0; di < devs.size(); ++di) {
+            auto& u = used[di];
+            for (const Dev::ArenaSpan& sp : devs[di].arena_spans) {
+                size_t e = sp.fixed;
+                if (sp.per_row > 0) e += sp.per_row * (size_t) (std::max<int64_t>(rows, 0) + kPrefillRowGuard);
+                e = std::min(e, sp.total);
+                if (e > 0) u.push_back({sp.off, sp.off + e});
+            }
+            std::sort(u.begin(), u.end(),
+                      [](const std::array<size_t, 2>& a, const std::array<size_t, 2>& b) { return a[0] < b[0]; });
+            std::vector<std::array<size_t, 2>> m;
+            for (const std::array<size_t, 2>& r : u) {
+                if (!m.empty() && r[0] <= m.back()[1]) m.back()[1] = std::max(m.back()[1], r[1]);
+                else m.push_back(r);
+            }
+            u.swap(m);
+        }
+        const bool partial = o.expert_lend && o.expert_cache;   // (only then does exit_prefill fill it again)
+        int64_t gone = 0, kept = 0;
+        double kept_gb = 0;
         for (Layer& l : L) {
             if (!l.lend) continue;
             // the perm bank keeps the spare at its last slot (as place_experts left it): the expert the cache had
@@ -5535,14 +5591,34 @@ struct Model::Impl {
             for (int e = 0; e < l.n_exp; ++e) {
                 const int s = l.slot[(size_t) e];
                 if (s < keep) continue;
-                l.slot[(size_t) e] = -1;
+                bool stay = false;
+                if (partial && s >= l.n_perm && s < l.n_perm + l.n_lend) {
+                    stay = true;
+                    for (int m = 0; m < l.nm && stay; ++m) {
+                        const Layer& x = member(l, m);
+                        const Dev& dm = devs[(size_t) x.dev];
+                        const size_t b0 = (size_t) (slot_ptr(x, s) - dm.arena), b1 = b0 + unit(x);
+                        for (const std::array<size_t, 2>& r : used[(size_t) x.dev])
+                            if (b0 < r[1] && r[0] < b1) {
+                                stay = false;
+                                break;
+                            }
+                    }
+                }
+                l.slot[(size_t) e] = -1;   // (out of the prompt's slot map either way: the lane serves it)
+                if (stay) {
+                    l.lend_keep.push_back({e, s});
+                    ++kept;
+                    kept_gb += (double) unit(l) * l.nm / 1e9;
+                } else {
+                    ++gone;
+                }
                 if (l.lay.fmt == gg::kFmtMXFP4) {   // (the file's mapping: mx_mat, or the RAM tier's copy)
                     l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
                 } else if (file_experts) {         // (its pages in the file)
                     l.hh[(size_t) e] = {file_part(l, e), nullptr, nullptr, nullptr};
                     l.host[(size_t) e] = l.hh[(size_t) e][0];
                 }
-                ++gone;
             }
             l.n_slots = l.n_perm;
             l.spare_vram = keep < l.n_perm ? keep : -1;
@@ -5558,16 +5634,24 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(x.vram_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice, dm.st));
             }
         }
-        // the arena's bytes as load left them: every chunk buffer and ring slot zero
-        for (Dev& d : devs) {
+        // the bytes this run touches, as load left them: zero (a bank kept in a tail is not touched at all)
+        for (size_t di = 0; di < devs.size(); ++di) {
+            Dev& d = devs[di];
             if (d.arena == nullptr || d.arena_bytes == 0) continue;
             cudaSetDevice(d.id);
-            CK(cudaMemsetAsync(d.arena, 0, d.arena_bytes, d.st));
+            if (used[di].empty()) {
+                CK(cudaMemsetAsync(d.arena, 0, d.arena_bytes, d.st));
+                continue;
+            }
+            for (const std::array<size_t, 2>& r : used[di])
+                CK(cudaMemsetAsync(d.arena + r[0], 0, r[1] - r[0], d.st));
         }
         sync_devs();
         if (o.verbose)
-            std::fprintf(stderr, "ds4 lend: the prompt took the arena back (%lld experts evicted of it)\n",
-                         (long long) gone);
+            std::fprintf(stderr,
+                         "ds4 lend: the prompt took the arena back (%lld experts evicted, %lld kept - %.1f GB in the "
+                         "buffers' tails)\n",
+                         (long long) gone, (long long) kept, kept_gb);
         return true;
     }
 
@@ -5575,6 +5659,16 @@ struct Model::Impl {
     // member its part, a copy stream a device (all of them at once); the cache's spare stays in the perm bank
     bool exit_prefill(std::string& err) {
         if (phase.load(std::memory_order_acquire) == 1) return true;
+        // the slots the prompt kept: out of its slot map, never out of the arena - back in the map (the `used` below
+        // then leaves them alone, and only the evicted experts are candidates for the refill)
+        for (Layer& l : L) {
+            for (const std::pair<int, int>& kv : l.lend_keep) {
+                if (l.slot[(size_t) kv.first] < 0) l.slot[(size_t) kv.first] = kv.second;
+                l.host[(size_t) kv.first] = nullptr;
+                l.hh[(size_t) kv.first] = {nullptr, nullptr, nullptr, nullptr};
+            }
+            l.lend_keep.clear();
+        }
         if (!o.expert_lend || !o.expert_cache) {
             phase.store(1, std::memory_order_release);
             return true;
@@ -5589,17 +5683,31 @@ struct Model::Impl {
             const int n_tot = std::min(l.n_exp, l.n_perm + l.n_lend);
             const bool perm_spare = o.expert_cache && l.n_perm >= 2 && l.n_perm < l.n_exp;
             const bool keep_spare = o.expert_cache && n_tot >= 2 && n_tot < l.n_exp;
-            const int spare = keep_spare ? (perm_spare ? l.n_perm - 1 : n_tot - 1) : -1;
-            l.n_slots = n_tot;
-            l.spare_vram = spare;
-            l.n_vram = n_tot - (spare >= 0 ? 1 : 0);
             std::vector<char> used((size_t) std::max(0, n_tot), 0);
             for (int e = 0; e < l.n_exp; ++e)
                 if (l.slot[(size_t) e] >= 0 && l.slot[(size_t) e] < n_tot) used[(size_t) l.slot[(size_t) e]] = 1;
             std::vector<int> frees;
             for (int s = 0; s < n_tot; ++s)
-                if (s != spare && !used[(size_t) s]) frees.push_back(s);
-            if (frees.empty()) continue;
+                if (!used[(size_t) s]) frees.push_back(s);
+            // the spare is a free slot: the perm bank's last one when the prompt left it (it always does), else the
+            // last lend slot the prompt kept out of a bank - it stays empty for the cache's swaps
+            int spare = -1;
+            if (keep_spare) {
+                const int want = perm_spare ? l.n_perm - 1 : n_tot - 1;
+                auto it = std::find(frees.begin(), frees.end(), want);
+                if (it != frees.end()) {
+                    spare = want;
+                    frees.erase(it);
+                } else if (!frees.empty()) {
+                    spare = frees.back();
+                    frees.pop_back();
+                }
+            }
+            l.n_slots = n_tot;
+            l.spare_vram = spare;
+            l.n_vram = n_tot - (spare >= 0 ? 1 : 0);
+            // (no `if (frees.empty()) continue`: the tab below must still go out - the slots the prompt kept are back
+            // in the map, and the decode kernels read them from it)
             std::vector<int> cands;
             for (int e = 0; e < l.n_exp; ++e)
                 if (l.slot[(size_t) e] < 0) cands.push_back(e);
@@ -7581,7 +7689,13 @@ struct Model::Impl {
             toks.push_back(tk[t]);
             ctoks.push_back(ctok(pos + t, tk[t]));
         }
-        if (!enter_prefill(err)) return false;   // (the arena's experts out, its buffers zeroed)
+        // the run's widest chunk: what the buffers are used to, so the prompt takes back only that much of the arena
+        int64_t run_rows = 0;
+        for (const Run& r : runs)
+            for (int t : r.T) run_rows = std::max<int64_t>(run_rows, t);
+        for (const Run& r : truns)
+            for (int t : r.T) run_rows = std::max<int64_t>(run_rows, t);
+        if (!enter_prefill(run_rows, err)) return false;   // (the arena's experts out, its buffers zeroed)
         plan_streams();
         if (snap_slot >= 0) {   // feed_mark: the state before the run's last row, kept by its layers on the way
             for (Run& r : runs) r.snap_pos = pos + n - 1;
