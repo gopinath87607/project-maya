@@ -3,10 +3,16 @@
 # prompt through each, every logit row dumped, the files compared byte for byte, the greedy tokens compared).
 #
 #   tools/ds4/bytecheck.sh <base maya-ds4> <new maya-ds4> <pack> <out dir> <ids file> [<check> ...]
-#     checks: windows (DS4_CHUNK_MIN=100000: windows of 16), chunked (the prompt as one chunked run), drafter
-#             (--dspark on); default: windows chunked.  64 greedy tokens after the prompt.
+#     checks: windows (DS4_CHUNK_MIN=100000: windows of 16), chunked (the prompt as one chunked run), capped (the
+#             chunk path with a part ceiling below the global chunk), drafter (--dspark on); default: windows chunked.
+#             64 greedy tokens after the prompt.
 #   env: NEW_RESERVE_MIB (default 600, the engine's --reserve-mib default; the packed KV caches: 624, 626 with the
-#        drafter - see "placement" below); GPU (default 0); CTX (default 8192)
+#        drafter - see "placement" below); GPU (default 0); CTX (default 8192); CHUNK (chunked: 8192); CAP (capped: 8192)
+#
+# The chunk path's two builds.  The one before --prefill-chunk could enable the path on its own takes it only with
+# --threads on (chunk = par ? ... : 0); the new one takes it from --prefill-chunk / --prefill-chunk-max / DS4_CHUNK
+# alone, with decode left serial.  So the chunked and capped arms give the base --threads on and the new build the flag:
+# same chunks, same order, same bits, without the new build running the threaded decode.
 #
 # Placement.  --no-expert-cache --expert-profile none fix WHICH experts VRAM holds (by index) and keep them there, but
 # not HOW MANY: that follows the free VRAM at load.  A change that frees or uses VRAM (smaller caches, a new buffer)
@@ -40,9 +46,13 @@ run() {   # <build> <check> <exe> [env ...] -- <args ...>
         shift
     done
     shift
-    local reserve=600
+    local reserve=600 extra=()
     [ "$b" = new ] && reserve=${NEW_RESERVE_MIB:-600}
-    env CUDA_VISIBLE_DEVICES=${GPU:-0} ${envs[@]+"${envs[@]}"} "$exe" $common --reserve-mib $reserve "$@" --ids "$ids" \
+    # the new build's prompt arena is one cudaMalloc of the chunk buffers' bytes (lending off here: the base build
+    # rejects the flag, the arenas must be the same bytes either way)
+    [ "$b" = new ] && extra=(--no-expert-lend)
+    env CUDA_VISIBLE_DEVICES=${GPU:-0} ${envs[@]+"${envs[@]}"} "$exe" $common --reserve-mib $reserve \
+        ${extra[@]+"${extra[@]}"} "$@" --ids "$ids" \
         --dump-logits "$out/${b}_$c.f32" > "$out/${b}_$c.out" 2> "$out/${b}_$c.err"
     echo "$b $c rc=$?"
 }
@@ -52,7 +62,19 @@ for c in $checks; do
         [ $b = new ] && exe=$new
         case $c in
         windows) run $b $c "$exe" DS4_CHUNK_MIN=100000 -- --dspark none ;;
-        chunked) run $b $c "$exe" -- --dspark none --window 1048576 ;;
+        chunked)
+            if [ $b = base ]; then
+                run $b $c "$exe" -- --dspark none --window 1048576 --threads on
+            else
+                run $b $c "$exe" DS4_CHUNK=${CHUNK:-8192} -- --dspark none --window 1048576
+            fi ;;
+        capped)   # a part ceiling below the global chunk: group 0's step is the cap, not the chunk (one GPU: the base
+                  # with the cap as its flat chunk must match, same run, same buffers)
+            if [ $b = base ]; then
+                run $b $c "$exe" -- --dspark none --window 1048576 --threads on --prefill-chunk ${CAP:-8192}
+            else
+                run $b $c "$exe" DS4_CHUNK=${CAPG:-16384} DS4_CHUNK_MAX=${CAP:-8192} -- --dspark none --window 1048576
+            fi ;;
         drafter) run $b $c "$exe" -- --dspark on ;;
         *) echo "unknown check $c" && exit 2 ;;
         esac

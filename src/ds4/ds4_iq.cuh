@@ -1,7 +1,8 @@
 // src/ds4/ds4_iq.cuh - a GGUF's routed experts in ggml's low-bit block types on the device for maya-ds4: the i-quants
 // IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and the K-quants Q2_K, Q3_K, Q4_K (256 values a block, ggml's layouts:
-// ggml-common.h, llama.cpp MIT).  ds4_gguf.cu sends an expert layer here when its experts are not MXFP4
-// (x3::ExpertLayout::fmt kFmtMXFP4 with K[r] = role r's ggml type; K[r] == kTypeMXFP4: ds4_gguf.cu's own kernels).
+// ggml-common.h, llama.cpp MIT), and MXFP4 (32 values a block) as a role's type.  ds4_gguf.cu sends an expert layer here
+// when its experts are not all MXFP4 (x3::ExpertLayout::fmt kFmtMXFP4 with K[r] = role r's ggml type; an all-MXFP4 layer:
+// ds4_gguf.cu's own kernels).
 //
 // Every weight is decoded exactly (ggml's dequantize_row_*: a block scale times an integer scale times a grid or code
 // value) and every product takes the activations rounded to int8 per 32 values with an F32 scale (ds4_gguf.cu's
@@ -22,9 +23,9 @@ constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ2_XS = 17, k
 
 /// Whether the device kernels take this ggml type.
 bool supported(int type);
-/// Bytes of a block (256 values) of the type (0: not one of these).
+/// Bytes of a block (256 values of the low-bit types, 32 of MXFP4) of the type (0: not one of these).
 int block_bytes(int type);
-/// Bytes of a row of k values (k % 256 == 0).
+/// Bytes of a row of k low-bit values (k % 256 == 0; an MXFP4 role's rows are mx_row_bytes's, ds4_gguf.cuh).
 inline size_t row_bytes(int type, int64_t k) { return (size_t) (k / 256) * (size_t) block_bytes(type); }
 /// The type's name ("?" when unknown).
 const char* name(int type);

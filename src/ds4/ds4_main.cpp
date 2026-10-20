@@ -66,9 +66,10 @@ std::vector<int> parse_ids(const std::string& s) {
 
 void usage() {
     std::fprintf(stderr,
-                 "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
-                 "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
-                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
+                 "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N] [--reserve-pct P0,P1,...]\n"
+                 "           [--no-expert-lend] [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
+                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--prefill-chunk-max N0,N1,...]\n"
+                 "           [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
@@ -443,9 +444,24 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 out += b;
             }
             if (d_off > 0) {
-                std::snprintf(b, sizeof b, " drafts=%.3f", (double) d_acc / (double) d_off);
+                std::snprintf(b, sizeof b, " drafts=%.3f draft_n=%.2f", (double) d_acc / (double) d_off,
+                              (double) d_off / fed);
                 out += b;
             }
+            // the loan (the Monitor's Loan tab): the layout the engine is in (0 the prompt's, 1 the decoder's) and the
+            // last refill's experts, GB and ms - the same numbers the engine's own lend line carries
+            std::snprintf(b, sizeof b, " phase=%lld lend_n=%lld lend_gb=%.2f lend_ms=%.0f", (long long) s.phase,
+                          (long long) s.lend_n, s.lend_gb, s.lend_ms);
+            out += b;
+            if (s.path >= 0) out += s.path != 0 ? " path=flow" : " path=windows";
+            // the drafter and its verification, a token; the n-gram memory's rows a token, the share of them its cache
+            // served, and the rows it holds
+            const double eg_rows = (double) (s.eg_rows - s_dec.eg_rows);
+            std::snprintf(b, sizeof b, " draft_ms=%.3f verify_ms=%.3f eg_rows=%.2f eg_hit=%.3f eg_cache=%lld",
+                          (s.draft_ms - s_dec.draft_ms) / fed, (s.verify_ms - s_dec.verify_ms) / fed, eg_rows / fed,
+                          eg_rows > 0 ? (eg_rows - (double) (s.eg_reads - s_dec.eg_reads)) / eg_rows : 1.0,
+                          (long long) s.eg_cached);
+            out += b;
             std::printf("%s\n", out.c_str());
         };
         for (;;) {
@@ -534,7 +550,12 @@ int main(int argc, char** argv) {
         else if (a == "--gpus") {
             for (int g : parse_ids(val("--gpus"))) o.gpus.push_back(g);
         } else if (a == "--max-context") o.max_context = std::atoll(val("--max-context").c_str());
-        else if (a == "--reserve-mib") o.reserve_mib = std::atoll(val("--reserve-mib").c_str());
+        else if (a == "--reserve-mib") {
+            o.reserve_mib = std::atoll(val("--reserve-mib").c_str());
+            o.reserve_set = true;
+        }
+        else if (a == "--reserve-pct") o.reserve_pct = parse_ids(val("--reserve-pct"));
+        else if (a == "--no-expert-lend") o.expert_lend = false;
         else if (a == "--vram-experts") o.vram_experts = std::atof(val("--vram-experts").c_str());
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val("--cpu-threads").c_str());
         else if (a == "--expert-profile") o.profile = val("--expert-profile");
@@ -547,6 +568,7 @@ int main(int argc, char** argv) {
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
+        else if (a == "--prefill-chunk-max") o.prefill_chunk_max = parse_ids(val("--prefill-chunk-max"));
         else if (a == "--threads") o.threads = val("--threads") != "off";
         else if (a == "--vision") o.vision = val("--vision") != "off";
         else if (a == "--mmap-experts") {

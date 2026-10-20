@@ -36,7 +36,7 @@ __host__ __device__ inline size_t q8_row_bytes(int64_t k) { return (size_t) (k /
 
 /// A GGUF expert layer (x3::ExpertLayout::fmt kFmtMXFP4: block-quantized experts read in place) keeps each role's ggml
 /// type in lay.K[r] (r: gate, up, down; 0 = MXFP4): MXFP4 takes these kernels, the low-bit types ds4_iq.cuh's (gate
-/// and up of one type).  Roles of one layer may differ (down of another type); MXFP4 and a low-bit type do not mix.
+/// and up of one type).  Roles of one layer may differ (down of another type, MXFP4 or a low-bit one).
 inline int expert_type(const x3::ExpertLayout& l, int r) { return l.K[r] == 0 ? kTypeMXFP4 : l.K[r]; }
 inline bool mx_experts(const x3::ExpertLayout& l) {
     return expert_type(l, 0) == kTypeMXFP4 && expert_type(l, 1) == kTypeMXFP4 && expert_type(l, 2) == kTypeMXFP4;

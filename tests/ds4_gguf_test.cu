@@ -583,6 +583,7 @@ std::vector<uint8_t> q_rand(int type, int n, int k) {
     for (size_t o = 0; o < w.size(); o += bb) {
         const float d = 0.001f + 0.002f * std::fabs(frand());
         switch (type) {
+            case gg::kTypeMXFP4: w[o] = (uint8_t) (120 + rng() % 6); break;   // (an E8M0 scale, as mx_rand's)
             case gg::iq::kQ4_K: put(o, d), put(o + 2, 0.5f * d); break;
             case gg::iq::kQ2_K: put(o + 80, d), put(o + 82, 0.5f * d); break;
             case gg::iq::kQ3_K: put(o + 108, d); break;
@@ -881,7 +882,8 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
                 yp[i] = yo[i].data();
             }
             gg::iq_cpu_down(fm, E.mat(e, 2), hp, n, yp, 0, D);
-            // the reference on the Q8_K values the CPU took (block_q8_K: F32 d, int8 qs[256], int16 bsums[16])
+            // the reference on the values the CPU's activations hold (block_q8_K: F32 d, int8 qs[256]; block_q8_0: F16
+            // d, int8 qs[32] - an MXFP4 down's activation type)
             auto q8k = [](const std::vector<uint8_t>& q, int kk) {
                 std::vector<float> v(kk);
                 for (int b = 0; b < kk / 256; ++b) {
@@ -892,11 +894,25 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
                 }
                 return v;
             };
-            const bool k8 = fm.gu_act == GGML_TYPE_Q8_K && fm.d_act == GGML_TYPE_Q8_K;
+            auto q80 = [](const std::vector<uint8_t>& q, int kk) {
+                std::vector<float> v(kk);
+                for (int b = 0; b < kk / 32; ++b) {
+                    __half d;
+                    std::memcpy(&d, q.data() + (size_t) b * 34, 2);
+                    for (int j = 0; j < 32; ++j)
+                        v[b * 32 + j] = __half2float(d) * (float) (int8_t) q[(size_t) b * 34 + 2 + j];
+                }
+                return v;
+            };
+            auto act_ok = [](int t) { return t == GGML_TYPE_Q8_K || t == GGML_TYPE_Q8_0; };
+            auto dec = [&](const std::vector<uint8_t>& q, int kk, int act) {
+                return act == GGML_TYPE_Q8_K ? q8k(q, kk) : q80(q, kk);
+            };
+            const bool k8 = act_ok(fm.gu_act) && act_ok(fm.d_act);
             std::vector<float> got_h, got_y;
             std::vector<double> want_h, want_y;
             for (int i = 0; i < n && k8; ++i) {
-                const std::vector<float> xa = q8k(aq[i], D), ha = q8k(hq[i], F);
+                const std::vector<float> xa = dec(aq[i], D, fm.gu_act), ha = dec(hq[i], F, fm.d_act);
                 for (int f = 0; f < F; ++f) {
                     got_h.push_back(ff[i][f]);
                     want_h.push_back(swiglu(E.dot(e, 0, f, xa.data()), E.dot(e, 1, f, xa.data()), lim));
@@ -910,8 +926,8 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
                 std::printf("%-44s FAIL  activation types %d / %d\n", "  CPU lane", fm.gu_act, fm.d_act);
                 ++g_fail;
             } else {
-                expect("  CPU lane gate/up (Q8_K)", got_h.data(), want_h.data(), want_h.size(), 1e-4);
-                expect("  CPU lane down (Q8_K)", got_y.data(), want_y.data(), want_y.size(), 1e-4);
+                expect("  CPU lane gate/up (the CPU's activations)", got_h.data(), want_h.data(), want_h.size(), 1e-4);
+                expect("  CPU lane down (the CPU's activations)", got_y.data(), want_y.data(), want_y.size(), 1e-4);
             }
         }
     }
@@ -920,12 +936,13 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
     cudaFree(dpart), cudaFree(dwo);
 }
 
-// the role pairs the tests take: every type as gate / up and as down
+// the role pairs the tests take: every type as gate / up and as down, and a low-bit gate / up with an MXFP4 down (unsloth's
+// UD-IQ3_XXS: 30 of its 40 layers)
 const std::pair<int, int> kQPairs[] = {
     {gg::iq::kIQ2_XXS, gg::iq::kIQ3_XXS}, {gg::iq::kIQ2_XS, gg::iq::kIQ3_XXS}, {gg::iq::kIQ3_XXS, gg::iq::kIQ2_XS},
     {gg::iq::kIQ2_S, gg::iq::kIQ3_S},     {gg::iq::kIQ3_XXS, gg::iq::kIQ3_S},   {gg::iq::kIQ4_XS, gg::iq::kQ4_K},
     {gg::iq::kQ2_K, gg::iq::kQ3_K},       {gg::iq::kQ4_K, gg::iq::kIQ4_XS},     {gg::iq::kQ3_K, gg::iq::kQ2_K},
-    {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS},   {gg::iq::kIQ3_S, gg::iq::kIQ2_S}};
+    {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS},   {gg::iq::kIQ3_S, gg::iq::kIQ2_S},     {gg::iq::kIQ2_XS, gg::kTypeMXFP4}};
 
 // the Engram table's Q6_K rows (ds4_kernels.cu's q6k_value, engram_dequant / engram_dequant_tok fmt 1) against
 // ggml's dequantize_row_q6_K, bit for bit: the rows are random bytes, each block's d a small positive half

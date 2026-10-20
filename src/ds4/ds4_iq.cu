@@ -34,11 +34,18 @@ template <> struct Ty<kIQ4_XS> { static constexpr int B = 136, TAB = 4, MIN = 0;
 template <> struct Ty<kQ4_K> { static constexpr int B = 144, TAB = 0, MIN = 1; };
 template <> struct Ty<kQ2_K> { static constexpr int B = 84, TAB = 0, MIN = 1; };
 template <> struct Ty<kQ3_K> { static constexpr int B = 110, TAB = 0, MIN = 0; };
-// MXFP4 (ds4_gguf.cu's own kernels everywhere else): a block of 32 values, an E8M0 scale then 16 code bytes; the light
-// sets take it too
+// MXFP4 (ds4_gguf.cu's own kernels where a whole layer is MXFP4): a block of 32 values, an E8M0 scale then 16 code bytes -
+// a role type of a mixed layer like the others (UD-IQ3_XXS's down), and the light sets take it too
 constexpr int kMXFP4 = 39;
 template <> struct Ty<kMXFP4> { static constexpr int B = 17, TAB = 0, MIN = 0; };
 template <int T> constexpr int kQK = T == kMXFP4 ? 32 : 256;   // values a block
+// an E8M0 scale byte as F32: ggml's GGML_E8M0_TO_FP32_HALF (the codes are the E2M1 values doubled)
+__device__ __forceinline__ float e8m0(uint8_t e) { return __uint_as_float(e < 2 ? 0x00200000u << e : (e - 1) << 23); }
+// a code's value (ggml's kvalues_mxfp4: E2M1 doubled)
+__device__ __forceinline__ int mx_val(int code) {
+    constexpr int kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    return kv[code];
+}
 static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_xs) == 74 && sizeof(block_iq2_s) == 82 &&
                   sizeof(block_iq3_xxs) == 98 &&
                   sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 && sizeof(block_q4_K) == 144 &&
@@ -131,7 +138,7 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
             s.q[4 + i] = v.y;
         }
         const uint32_t e = b[0];   // 2^(e - 128): ggml's GGML_E8M0_TO_FP32_HALF (the codes are the E2M1 values doubled)
-        s.d = __uint_as_float(e < 2 ? 0x00200000u << e : (e - 1) << 23);
+        s.d = e8m0((uint8_t) e);
         s.s0 = s.s1 = 1;
         (void) ib;
         (void) tab;
@@ -279,8 +286,15 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
 template <int T>
 __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, int p, const uint32_t* tab, float* w) {
     const int ib = kb & 7;
-    const uint8_t* b = row + (size_t) (kb >> 3) * Ty<T>::B;
-    if constexpr (T == kIQ2_XXS) {
+    const uint8_t* b = row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B;
+    if constexpr (T == kMXFP4) {   // value j in byte j's low nibble, j + 16 in its high one
+        const float d = e8m0(b[0]);
+        const uint8_t* q = b + 1 + 8 * (p & 1);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] = d * (float) mx_val(p < 2 ? q[j] & 15 : q[j] >> 4);
+        (void) ib;
+        (void) tab;
+    } else if constexpr (T == kIQ2_XXS) {
         const uint8_t* q = b + 2 + 8 * ib;
         const uint32_t a1 = ld2(q + 4);
         const uint2 g = ((const uint2*) tab)[q[p]];
@@ -815,6 +829,7 @@ bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later, STRATA_DS4_NO_TC=1 keeps 
 // F(T) for the type t at run time; false when it is not one of these
 #define DS4_IQ_SWITCH(t, F)          \
     switch (t) {                     \
+        case kMXFP4: F(kMXFP4); break;     \
         case kIQ2_XXS: F(kIQ2_XXS); break; \
         case kIQ2_XS: F(kIQ2_XS); break;   \
         case kIQ2_S: F(kIQ2_S); break;     \
@@ -865,19 +880,33 @@ struct LightBuf {
     int8_t* q = nullptr;
     float* d = nullptr;
     size_t cap = 0;
+    bool dead = false;   // (the stream asked once; the tiles serve it from here)
 };
 std::mutex g_lmu;
 std::unordered_map<cudaStream_t, LightBuf> g_light;
 LightBuf* light_buf(cudaStream_t s, int k) {
     std::lock_guard<std::mutex> lk(g_lmu);
     LightBuf& b = g_light[s];
+    if (b.dead) return nullptr;
     const size_t need = (size_t) kLightMaxExp * kLightRows * (size_t) std::max(k, 8192);
     if (b.cap < need) {
         if (b.q != nullptr) cudaFree(b.q);
         if (b.d != nullptr) cudaFree(b.d);
         b = LightBuf{};
-        if (cudaMalloc(&b.q, need) != cudaSuccess || cudaMalloc(&b.d, need / 32 * sizeof(float)) != cudaSuccess) {
-            std::fprintf(stderr, "ds4 iq: the light sets' scratch (%zu MB) failed\n", need >> 20);
+        if (cudaMalloc(&b.q, need) != cudaSuccess) {
+            cudaGetLastError();   // (clears it: the tiles' own checks must not report the scratch's failure)
+            std::fprintf(stderr, "ds4 iq: the light sets' scratch (%zu MB) failed; the tiles serve this stream\n",
+                         need >> 20);
+            b.dead = true;
+            return nullptr;
+        }
+        if (cudaMalloc(&b.d, need / 32 * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "ds4 iq: the light sets' scratch (%zu MB) failed; the tiles serve this stream\n",
+                         need >> 20);
+            cudaFree(b.q);
+            b = LightBuf{};
+            b.dead = true;
             return nullptr;
         }
         b.cap = need;
@@ -939,6 +968,7 @@ bool supported(int t) { return block_bytes(t) > 0; }
 
 int block_bytes(int t) {
     switch (t) {
+        case kMXFP4: return Ty<kMXFP4>::B;
         case kIQ2_XXS: return Ty<kIQ2_XXS>::B;
         case kIQ2_XS: return Ty<kIQ2_XS>::B;
         case kIQ2_S: return Ty<kIQ2_S>::B;
@@ -954,6 +984,7 @@ int block_bytes(int t) {
 
 const char* name(int t) {
     switch (t) {
+        case kMXFP4: return "MXFP4";
         case kIQ2_XXS: return "IQ2_XXS";
         case kIQ2_XS: return "IQ2_XS";
         case kIQ2_S: return "IQ2_S";

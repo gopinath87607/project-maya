@@ -22,7 +22,14 @@ struct Options {
     std::string pack;                 // <model>/maya-ds4
     int64_t max_context = 32768;
     std::vector<int> gpus;            // empty: every visible GPU
-    int64_t reserve_mib = 600;        // VRAM left free on each GPU
+    int64_t reserve_mib = 600;        // VRAM left free on each GPU (--reserve-mib: every GPU, and it wins over the pct)
+    bool reserve_set = false;         // --reserve-mib was given (otherwise --reserve-pct, or the default, decides)
+    // VRAM left free per GPU as a per cent of the card's total: --reserve-pct "1,1,2,2" (one entry per GPU in the
+    // split's order; a single entry applies to every GPU, a short list repeats its last one; floor 64 MiB)
+    std::vector<int> reserve_pct;
+    // the prompt's VRAM (the chunk buffers and the CPU lane's ring) lent to the experts between prompts: the same
+    // bytes are the prompt's buffers during a run and expert banks while decoding (--no-expert-lend keeps them apart)
+    bool expert_lend = true;
     double vram_experts = 1.0;        // the share of the expert budget to use (tests: less, so the CPU lane works)
     int cpu_threads = 0;              // 0: the physical cores
     std::string profile;              // expert hit counts (read to place the hottest experts in VRAM, written back)
@@ -41,6 +48,11 @@ struct Options {
     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
     // -1: 2048, or 8192 with the experts read in place (every chunk streams them all from the files)
     int prefill_chunk = -1;
+    // this part's own ceiling on the prompt chunk: --prefill-chunk-max "8192,8192,16384,16384", one entry per part in
+    // the split's order (the CUDA index), 0 or absent = no ceiling.  --prefill-chunk stays the whole split's ceiling
+    // and every part's step is the largest whole multiple of the step of the part feeding it at most its ceiling (the
+    // hop copies a part's step out of its feeder's chunks a piece at a time), so the parts' chunks can differ and nest
+    std::vector<int> prefill_chunk_max;
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
     bool verbose = false;
@@ -74,6 +86,13 @@ struct Stats {
     // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted
     int64_t draft_reached[8] = {}, draft_kept[8] = {};
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
+    // the expert lending (--reserve-pct / default): the layout the engine is in now (0 the prompt's, 1 the decoder's)
+    // and the last refill's experts, GB and ms - the Monitor's Loan tab reads them from the STAT lines
+    int64_t phase = 0;
+    int64_t lend_n = 0;
+    double lend_gb = 0.0, lend_ms = 0.0;
+    // the last prompt that chose between the chunk path (the flow) and windows: 1 the flow, 0 windows, -1 none yet
+    int64_t path = -1;
 };
 
 class Model {
