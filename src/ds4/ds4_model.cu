@@ -6673,7 +6673,7 @@ struct Model::Impl {
         cudaStream_t s = d.st;
         const int D = g.dim, H = g.hc, nk = (int) run.T.size();
         Streamer S;   // (none: the flow streams)
-        const size_t hb = chunk_hand_bytes();
+        const size_t hb = chunk_hand_bytes(c.C);
         // the Engram rows: (layer, chunk) after (layer, chunk) in the run's order, each read on a helper thread while
         // the one before runs (slot u % 2, once unit u - 2's copy of it is done)
         std::vector<std::pair<int, int>> egu;   // (Engram layer, chunk)
@@ -7264,7 +7264,7 @@ struct Model::Impl {
         }
         int64_t rows = 0;
         for (int T : run.T) rows += T;
-        const size_t hb = chunk_hand_bytes(), state_b = run.T.size() * hb;
+        const size_t hb = chunk_hand_bytes(c.C), state_b = run.T.size() * hb;
         const double moved = 2.0 * (double) rows * ((double) hb / (double) chunk) * (double) g.nl;
         if (need == 0 || (double) (run.T.size() - 1) * file_b <= moved) return false;
         size_t lc_bytes = need;
@@ -7400,7 +7400,7 @@ struct Model::Impl {
             for (size_t i = 0; i < chunk_done.size(); ++i) chunk_rec[i].store(0);
         }
         prof_chunk = prof_on;
-        const bool lm = lm_begin(run);
+        const bool lm = lm_begin(hrun);   // (one device only: the head's run is the run)
         struct LmEnd {   // (every way out: its host memory freed once the device is done with it)
             Impl* p;
             bool on;
@@ -7468,7 +7468,8 @@ struct Model::Impl {
                 char lcs[160] = "";
                 if (c.lm)
                     std::snprintf(lcs, sizeof lcs, ", %llu again from the layer cache (layer-major, %d chunks, %.1f GB "
-                                  "of RAM)", (unsigned long long) c.it_lc, (int) run.T.size(), (double) c.lc_bytes / 1e9);
+                                  "of RAM)", (unsigned long long) c.it_lc,
+                                  (int) runs[(size_t) devs[di].grp].T.size(), (double) c.lc_bytes / 1e9);
                 std::fprintf(stderr,
                              "ds4 prompt stream, CUDA%d: %d tokens in %.0f ms; %llu experts streamed: %llu from the files "
                              "(%.1f GB, %.2f GB/s: %.1f GB from the disk unbuffered, %.1f GB through the page cache), %llu "
