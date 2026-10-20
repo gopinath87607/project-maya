@@ -9,6 +9,14 @@
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.27 LANGUAGES CXX)
+
+# Maya's build options by the names its docs give them: -DMAYA_X=... sets STRATA_X, the name this file reads
+get_cmake_property(_maya_cache CACHE_VARIABLES)
+foreach(_v IN LISTS _maya_cache)
+  if(_v MATCHES "^MAYA_(.+)$")
+    set(STRATA_${CMAKE_MATCH_1} "${${_v}}")
+  endif()
+endforeach()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
@@ -76,11 +84,29 @@ if(STRATA_ENABLE_CUDA)
     endif()
     if(_base LESS 75)
       message(FATAL_ERROR
-        "Strata needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series), but "
+        "Maya needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series), but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
     endif()
   endforeach()
-  message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
+  message(STATUS "Maya: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
+  # Pascal (sm_6x - a "native" build on a Tesla P40, as maya.py's arch_setting() asks for below sm_75): GP102 / GP104
+  # cache global loads in L2 only unless the code is compiled to cache them in L1 as well, and the decode's GEMVs - many
+  # small loads of weights, scales and the q8_1 activations every warp of a block reads - starve there (Maya-L's Q6_K
+  # dense GEMV ran at a quarter of a P40's bandwidth or less).  -dlcm=ca caches them in L1, as Volta and newer do by
+  # default: two P40s, decode 9.7 -> 16.9 tok/s with Maya-L and 9.4 -> 28.0 with Maya-S24, the same answers (#212).
+  # A build for sm_70 and newer only is unchanged.
+  set(_strata_archs "${CMAKE_CUDA_ARCHITECTURES}")
+  if(_strata_archs MATCHES "native")
+    set(_strata_archs "${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
+  endif()
+  foreach(_a IN LISTS _strata_archs)
+    string(REGEX REPLACE "-.*$" "" _base "${_a}")
+    if(_base MATCHES "^6[0-9]$")
+      string(APPEND CMAKE_CUDA_FLAGS " -Xptxas -dlcm=ca")
+      message(STATUS "Maya: Pascal (sm_${_base}): global loads cached in L1 (-Xptxas -dlcm=ca)")
+      break()
+    endif()
+  endforeach()
   # CMake links CUDA code with the static runtime (CMAKE_CUDA_RUNTIME_LIBRARY's default); on Windows the same runtime
   # must be named here too - MSVC's linker refuses cudart_static.lib and cudart.lib (the DLL's) in one program,
   # where Linux's takes the first of the duplicates
@@ -185,7 +211,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
              COMMAND strata-load --file ${CMAKE_CURRENT_SOURCE_DIR}/pack/full/experts.bin --layers 1)
     set_tests_properties(expert_arena_load PROPERTIES PASS_REGULAR_EXPRESSION "per-layer checksums")
   else()
-    message(STATUS "strata: pack/full/experts.bin absent - the expert arena load test is NOT registered")
+    message(STATUS "maya: pack/full/experts.bin absent - the expert arena load test is NOT registered")
   endif()
 
   # ---- strata_kernels (P2.S2) ----
@@ -243,12 +269,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/glm_fast.cu
                           src/kernels/cuda/glm_batch.cu
                           src/kernels/cuda/exl3.cu
+                          src/kernels/cuda/exl3_legacy.cu
                           src/kernels/cuda/glm_kv_stream.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
-  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+  if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
     add_executable(glm_layer_graph_test tests/glm_layer_graph_test.cu)
     target_link_libraries(glm_layer_graph_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_layer_graph_test COMMAND glm_layer_graph_test)
@@ -331,7 +358,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
-    src/core/glm_window.cu src/core/glm_dflash.cu)
+    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
@@ -381,9 +408,31 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
   endif()
 
-  add_executable(strata src/program/generate.cpp)
-  target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  add_executable(maya src/program/generate.cpp)
+  target_include_directories(maya PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(maya PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+
+  # DeepSeek-V4.1-Flash (EXL3, tools/ds4/pack.py; or a GGUF, tools/ds4/pack_gguf.py): its own engine over the kernel
+  # libraries (src/ds4)
+  # (CUDA, or HIP through include/strata/hip_compat as the GLM engine; Linux and Windows)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+    add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
+                              src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp)
+    target_include_directories(maya-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    target_link_libraries(maya-ds4 PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
+                          ${_strata_gpu_blas_target})
+    add_executable(ds4_cpu_bench tests/ds4_cpu_bench.cpp)
+    target_link_libraries(ds4_cpu_bench PRIVATE strata_kernels_cpu)
+    # the CPU lane's MXFP4 rows: every tier this CPU runs (and ggml-cpu's dot) at the experts' real size (no GPU)
+    add_executable(ds4_mx_bench tests/ds4_mx_bench.cpp src/ds4/ds4_gguf_cpu.cpp)
+    target_link_libraries(ds4_mx_bench PRIVATE strata_kernels_cpu)
+    # the GGUF kernels (BF16 matrices, MXFP4 experts) against a double-precision reference, and the packed KV caches
+    # against the BF16 rows bit for bit (needs a GPU, no model)
+    add_executable(ds4_gguf_test tests/ds4_gguf_test.cu src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu
+                                 src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_kernels.cu)
+    target_include_directories(ds4_gguf_test PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    target_link_libraries(ds4_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
+  endif()
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
@@ -403,6 +452,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(hip_expert_cache_staging PRIVATE strata_engine)
     add_test(NAME hip_expert_cache_staging COMMAND hip_expert_cache_staging)
     list(APPEND _strata_hip_tests hip_expert_cache_staging)
+    add_executable(hip_glm_expert_helper tests/hip/glm_expert_helper.cpp)
+    target_include_directories(hip_glm_expert_helper PRIVATE third_party/ggml)
+    target_link_libraries(hip_glm_expert_helper PRIVATE strata_engine)
+    add_test(NAME hip_glm_expert_helper COMMAND hip_glm_expert_helper)
+    set_tests_properties(hip_glm_expert_helper PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/intrinsics.cpp")
       add_executable(hip_intrinsics tests/hip/intrinsics.cpp)
       target_link_libraries(hip_intrinsics PRIVATE strata_hip_runtime)
@@ -816,18 +870,23 @@ if(STRATA_NATIVE_EXPERTS)
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx512.cpp)
+                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx512.cpp
+                                           src/kernels/cpu/iq_avx512_one.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/kq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(src/kernels/cpu/iq_avx512_one.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   else()
     # (no VNNI / VBMI needed - cpu_avx512bw_ok() is enough to run them; no FP contraction: their sums must take
     # ggml-cpu's float steps exactly, see iq_avx512.cpp)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mf16c;-mfma;-ffp-contract=off")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=off")
+    # the one-token IQ2_XXS rows: VBMI's multishift and BMI2's pdep (run only where cpu_avx512_ok() and BMI2 say so)
+    set_source_files_properties(src/kernels/cpu/iq_avx512_one.cpp PROPERTIES COMPILE_OPTIONS
+                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vbmi;-mbmi2;-mf16c;-mfma;-ffp-contract=off")
     # (AVX-512F/BW only: Skylake-SP Xeons have no VNNI, and this kernel does not need it)
     set_source_files_properties(src/kernels/cpu/kq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mf16c;-mfma")
@@ -953,8 +1012,10 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
+      src/prefill/moe_fused_rdna4.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_mmq}/quantize.cu")
+    target_compile_definitions(strata_engine PRIVATE STRATA_HIP_PREFILL_FUSED=1)
     foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
@@ -977,6 +1038,12 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME hip_prefill_mmq_parity COMMAND hip_prefill_mmq_parity)
     set_tests_properties(hip_prefill_mmq_parity PROPERTIES TIMEOUT 120)
     list(APPEND _strata_hip_tests hip_prefill_mmq_parity)
+    add_executable(hip_prefill_fused_parity tests/hip/prefill_fused_parity.cpp)
+    target_include_directories(hip_prefill_fused_parity PRIVATE "${_strata_gg}/include")
+    target_link_libraries(hip_prefill_fused_parity PRIVATE strata_prefill strata_kernels)
+    add_test(NAME hip_prefill_fused_parity COMMAND hip_prefill_fused_parity)
+    set_tests_properties(hip_prefill_fused_parity PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    list(APPEND _strata_hip_tests hip_prefill_fused_parity)
   endif()
   if(STRATA_ENABLE_HIP)
     # Optional real-model diagnostic: pass the GGUF shard containing the native PLE key.
@@ -1022,6 +1089,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+  # the EXL3 CPU lane's tiers on random experts: a band's compute speed, and an expert's time on T threads from DRAM
+  # in the engine's jobs (what the start-up timing compares with a copy over PCIe) - a benchmark, not a test
+  add_executable(exl3_cpu_bench src/kernels/cpu/exl3_cpu_bench.cpp)
+  target_link_libraries(exl3_cpu_bench PRIVATE strata_kernels_cpu)
 
   if(UNIX AND NOT APPLE)
     add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)

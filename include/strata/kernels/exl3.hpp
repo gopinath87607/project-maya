@@ -36,6 +36,10 @@ struct Mat {
     int K = 0;                           // bits per weight, 1..8
     int cb = 2;                          // codebook: 0 3inst, 1 mcg, 2 mul1
     int ld = 0;                          // tiles per 16-row slice in memory (the full matrix's n / 16); 0: n / 16
+    // a GGUF's plain matrix instead (DeepSeek-V4.1's maya-ds4: fmt 1 BF16): raw = [n][ld] (row r = output r, ld
+    // values a row; 0: k), the EXL3 fields unused - the engine sends it to its own kernels, never to these
+    int fmt = 0;
+    const void* raw = nullptr;
 };
 
 /// Trellis bytes of a k x n matrix at K bits.
@@ -47,7 +51,7 @@ bool supported(const Mat& m);
 
 /// y[r] = alpha * (x W)[r] + (bias ? bias[r] : 0).  x: xf (F32) when given, else xq (q8_1 blocks of k values).
 /// ncol > 1: as many activations (a verify window's tokens), activation c at xf + c xf_cs / xq + c xq_cs bytes, its
-/// y at y + c y_cs - the weights read and decoded once for up to 4 of them, and each y bit for bit its own job's.
+/// y at y + c y_cs - the weights read and decoded once for up to 8 of them, and each y bit for bit its own job's.
 struct MvJob {
     const Mat* m = nullptr;
     const float* xf = nullptr;
@@ -61,9 +65,17 @@ struct MvJob {
 constexpr int kMaxMvJobs = 8;
 constexpr int kMaxMvCols = 16;   // a job's activations at most
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// The calling thread's launches of mv(), moe_gate_up() and moe_down() read `flag` (a device int) first and do no work
+/// while it is non-zero (glmf::set_skip's, which sets it: a pipelined window's tokens past a wrong draft); nullptr (the
+/// default): no check.  The flag changes only between launches (skip_gate, on the same stream).  (v1.1.8's kernels
+/// before sm_80 do not read it.)
+void set_skip(const int* flag);
+/// How many pieces mv cuts m's inputs into on the current device (0: not covered) - one piece, and every column's
+/// sum is the same whatever columns the job holds (a view's, or the whole matrix's).
+int mv_splits(const Mat& m);
 
-/// Allocates the per-stream scratch of mv / moe_down on the current device, and lets the several-activation kernels
-/// use their shared memory there (call once per stream before a graph capture; mv does both on first use otherwise).
+/// Allocates the per-stream scratch of mv / moe / win_experts on the current device (call once per stream before a
+/// graph capture; the first use does it otherwise).
 bool prepare(cudaStream_t s);
 
 /// One routed expert's blob: three parts (gate, up, down) at byte offsets from the blob base, each holding the FP16
@@ -72,6 +84,7 @@ struct ExpertLayout {
     size_t suh[3] = {0, 0, 0}, svh[3] = {0, 0, 0}, trellis[3] = {0, 0, 0};
     int K[3] = {0, 0, 0};
     int cb = 2;
+    int fmt = 0;   // 2: a GGUF's MXFP4 expert (maya-ds4's own kernels): trellis[r] = matrix r's offset, [out][in / 32]
 };
 /// The routed experts of one token (the engine's device plan: plan_ptr[i] = the blob in VRAM, 0 = not on the device;
 /// plan_w[i] its weight).  gate/up over x (n_embd F32) -> clamped swiglu -> h (F32 [k][n_ff], scratch the caller
@@ -99,7 +112,8 @@ struct WinArgs {
     const int *grp_start = nullptr, *grp_ent = nullptr, *n_groups = nullptr;
     const unsigned long long* plan_ptr = nullptr;   // [T][8]
     const float* plan_w = nullptr;                  // [T][8]
-    const float* cpu_part = nullptr;                // [T][n_embd]
+    const float* cpu_part = nullptr;                // [T][n_embd] (rows cpu_stride apart when given)
+    size_t cpu_stride = 0;
     const int* cpu_flag = nullptr;                  // [T]
     const float* x = nullptr;
     size_t x_stride = 0;
@@ -111,10 +125,14 @@ struct WinArgs {
     ExpertLayout lay;
     int T = 0, k = 8, n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
+    // (given) the combine first waits on the device until *wait_ptr == wait_val (the host's answer to the CPU lane's
+    // part arrives while the device computes the experts); cpu_flag may be null (no CPU part)
+    const unsigned* wait_ptr = nullptr;
+    unsigned wait_val = 0;
 };
 bool win_experts(const WinArgs& a, cudaStream_t s);
-/// Whether the current device runs the several-activation kernels (win_experts; mv's ncol > 1 runs one activation at a
-/// time without them): they take ~58 KB of shared memory a block, which 48 KB GPUs lack.
+/// Whether the current device runs the several-activation kernels (win_experts; mv's ncol > 1): every device does
+/// (they take ~10 KB of shared memory a block).
 bool several_ok();
 
 /// The prompt path's tensor-core GEMMs (sm_80 and later; mma_supported() says whether this device runs them).
@@ -141,6 +159,16 @@ void gemm_rows(const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, i
 
 /// The full weight in the engine's row layout: dst[r][c] = W[c][r] (n rows of k values), BF16 or F16 bits.
 void reconstruct_rows(const Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
+/// The decoded W' alone in that layout: dst[c][r] = W'[r][c], F16 bits (exactly the decoded values) - for a product
+/// that rotates its activations and outputs instead of the weight (x W = H(H(x * suh) W') * svh): rows_rot_f16 before
+/// the GEMM, rows_rot_out after it.  No Hadamard over the k x n weight: a plain decode, at the memory's speed.
+void reconstruct_inner_rows(const Mat& m, uint16_t* dst, cudaStream_t s);
+/// out[r][c] = FP16(H(x_r * suh)[c]) for r < nrows, c < ncols (ncols % 128 == 0), x_r = x[idx ? idx[r] : r] (F32, ldx
+/// floats a row): an EXL3 matrix's rotated input rows, as the decode kernels rotate theirs.
+void rows_rot_f16(const float* x, int ldx, const int* idx, int nrows, int ncols, const uint16_t* suh, uint16_t* out,
+                  cudaStream_t s);
+/// y[r][c] = H(y_r)[c] * svh[c] in place for r < nrows, c < ncols (each 128 values one block; ldy floats a row).
+void rows_rot_out(float* y, int ldy, int nrows, int ncols, const uint16_t* svh, cudaStream_t s);
 /// The decoded W' alone, row-major [k][n] F16 bits (tests).
 void reconstruct_inner(const Mat& m, uint16_t* dst, cudaStream_t s);
 

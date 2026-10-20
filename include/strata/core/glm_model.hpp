@@ -26,6 +26,7 @@
 #include "strata/kernels/sampler.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <condition_variable>
@@ -134,6 +135,31 @@ public:
         double pool_gb = 0, ram_gb = 0;
     };
     FastStats fast_stats() const;
+    /// What a part holds on its GPU, in bytes (generate's VRAM lines, the Monitor's map of a GPU): the device's total
+    /// and free memory now, its PCI address (the server finds the GPU NVML numbers by it), the dense weights, the
+    /// sequence state (the DSA latent cache, KDA states, indexer keys; kv_ram: KV streaming's pinned copy in RAM), the
+    /// activations, a drafter's weights (DFlash or the NextN block) and the verify window's buffers, the expert pool
+    /// with its lendable tail and what a prompt (borrow, at most) or the vision encoder borrows of that tail.  The
+    /// CUDA context and the small buffers are not counted: total - free - the parts.
+    struct VramReport {
+        int dev = 0;
+        std::string pci;
+        uint64_t total = 0, free = 0;
+        uint64_t weights = 0, kv = 0, kv_ram = 0, act = 0, drafter = 0, window = 0;
+        uint64_t pool = 0, tail = 0, borrow = 0, vision = 0;
+        int64_t slots = 0, ctx = 0;
+        int l0 = 0, l1 = 0;
+    };
+    std::vector<VramReport> vram_report() const;
+    /// Every GPU's expert pool as it was sized (part order): the device, the VRAM kept free beside it (MiB), whether the
+    /// default reserve was lowered so a small card's pool holds its floor, and --expert-cache N (0: auto) - for the
+    /// driver's free-VRAM lines, which name the setting that leaves room
+    struct PoolVram {
+        int dev = 0, reserve_mib = 0;
+        bool adapted = false;
+        int64_t fixed = 0;
+    };
+    std::vector<PoolVram> pool_vram() const;
     /// The CPU LANE (a decode's RAM-tier experts): the share of them copied over PCIe to the GPU instead of computed
     /// on the CPU - 0: the CPU takes every one, 1: none (of f such experts in a route, f - round(share f) go to the
     /// CPU).  pcie_share(): the split in use, as a share; set_pcie_share(s): this split from the next token on, s < 0
@@ -153,6 +179,10 @@ public:
     /// set_read_chunks(n): n (1-16) from the next read on, n <= 0 the engine's own - for setup's calibration (per
     /// request, no restart): the best size depends on the drive, its driver and the CPU
     void set_read_chunks(int n);
+    /// The decode's light misses (STRATA_GLM_MISS_SKIP_W / _FROM, changes the answers): a routed expert that is not in
+    /// VRAM and carries less than w of the route's weights is left out on layers from `from` on.  set_miss_skip(w, from):
+    /// this request's bar and first layer (w < 0 / from < 0: the engine's own) - for sweeps without a restart.
+    void set_miss_skip(double w, int from);
     /// Conversation reuse (the fast path): save the sequence state at the current position - the recurrent KDA
     /// states and conv histories (the DSA caches are append-only, so the position alone restores them) - and
     /// restore it later to continue a prompt that extends the saved one.  false when unsupported.
@@ -260,6 +290,33 @@ public:
     int dev_ = 0;
     int n_parts_ = 1;                                      // the devices the layers are split across (the CPU lane's share)
     int part_ = 0;                                         // ... and which of them this one is (0 = the first layers)
+    // THE HEAD SPLIT (an EXL3 pack on 3+ parts; STRATA_GLM_HEAD_SPLIT=0: off): a pipelined window's pick on the last
+    // part reads the head's columns [0, head_c0_) there and [head_c0_, n_vocab) on a helper part at once (its own
+    // copy), the two argmaxes (or the helper's logits, sampling) joined on the last part - the same pick as the whole
+    // row's.  The helper: the part of the fewest layers between the first and the last (their head GEMV ~1.2 ms of
+    // a token on an RTX 5060 Ti)
+    bool head_half_ = false;          // this part (the helper) loads the head's columns [head_c0_, n_vocab)
+    int head_c0_ = 0;
+    Glm5Model* head_helper_ = nullptr;   // (the last part) the helper
+    float* hh_x_ = nullptr;            // (the helper) kPipeSlots head inputs (n_embd), their logits (n_vocab - c0)
+    float* hh_lg_ = nullptr;
+    int* hh_pair_ = nullptr;           // ... and their argmax pairs (argmax_pair)
+    cudaStream_t hh_s_ = nullptr;      // ... the stream they run on (the highest priority)
+    cudaEvent_t hh_ev_[64] = {};       // ... a slot's result out (pair or logits copied to the host)
+    float* hd_x_ = nullptr;            // (the helper) a draft's head rows (kWinMax x n_embd), their logits (n_vocab - c0)
+    float* hd_lg_ = nullptr;
+    void* hd_cand_ = nullptr;          // ... and their slices' top-k candidates (kHdCandBytes)
+    cudaStream_t hd_s_ = nullptr;      // ... the stream they run on (not hh_s_: behind a window's late picks there)
+    int* hh_skip_d_ = nullptr;         // (the helper) its skip flag for a pick's half (a token past a wrong draft)
+    static constexpr size_t kHdCandBytes = (size_t) 1 << 20;
+    float* ht_x_h_ = nullptr;          // (the last part) pinned: the slots' head inputs, the helper's logits, pairs
+    float* ht_lg_h_ = nullptr;
+    int* ht_pair_h_ = nullptr;
+    int* ht_pair_d_ = nullptr;         // ... on the device: [slot][2] own pair, [slot][2] the helper's
+    cudaEvent_t ht_ev_[64] = {};       // ... a slot's head input out to the host
+    bool head_split_ready() const { return head_helper_ != nullptr && ht_x_h_ != nullptr && ht_pair_d_ != nullptr; }
+    bool head_split_link(Glm5Model* helper, std::string& err);   // (the last part, after the load) the helper's buffers
+    bool win_head_split(int t, int sl, const float* hx, float* lg, std::string& err);
     std::vector<int> split_devs_;                          // ... and the CUDA devices of all of them, part by part
     std::unique_ptr<Glm5Model> split_next_;
     // parallel split load: parts take the RAM budget in part order, then pin their RAM tiers in part order too
@@ -443,6 +500,8 @@ public:
     std::map<std::string, const uint16_t*> w16_;           // the pack's big BF16 rows, kept BF16 (fast mode)
     bool fast_setup(std::string& err);
     bool fast_setup_finish(std::string& err);
+    bool dual_prefill_ready();   // STRATA_GLM_DUAL_PREFILL (glm_prefill.cu)
+    int dual_pf_state_ = 0;      // 0 not tried, 1 on, -1 off
     void ram_left_check() const;
     void fast_destroy();
     bool forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err);
@@ -504,6 +563,8 @@ public:
     std::vector<std::pair<int32_t, int32_t>> profile_;     // its ranked (layer, expert) pairs, read by fast_setup
     bool fast_warm(std::string& err);                      // load-time: stream every expert into the tiers
     bool fast_cpu_lane_setup(std::string& err);            // STRATA_GLM_CPU_LANE: the pool, its calibration, the split
+    bool fast_helper_setup(std::string& err);              // STRATA_GLM_EXPERT_HELPER: complementary GPU cache
+    bool fast_helper_adapt(std::string& err);              // helper-only, at an idle boundary
     void fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out);
     // the same on `pool` with the rows act / hq / ff / dn, or x3 for an EXL3 pack (a verify window's CPU lanes:
     // FastState::win_lane, each with its own rows)
@@ -520,8 +581,17 @@ public:
     int mtp_src_ = -1;                                     // the shard of STRATA_GLM_MTP_GGUF's block, -1: the model's
     int lt_ = 0;                                           // the tier layers: [l0_, lt_) = the trunk's + the draft's
     void* mtp_arena_ = nullptr;
+    uint64_t mtp_arena_bytes_ = 0;                         // (the VRAM report)
     bool load_mtp(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs, std::string& err);
-    bool fast_mtp(int64_t p, int32_t next_tok, std::string& err);   // the draft block at position p -> mtp_tok
+    // the draft block at position p -> mtp_tok[step] (see glm_fast_path.cu: the chained drafts and the draft head)
+    bool fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step = 0, bool sub = false, bool read_back = true);
+    void mtp_draft_setup();                                // fast_setup: the draft head's rows, the chain's embeddings
+    // the draft vocabulary (load_pack, from the GGUF's tokenizer - see glm_mtp.cu): ids [0, mtp_vlead_) and
+    // mtp_vextra_; mtp_vin_[id] != 0 for each (empty: the whole head)
+    int mtp_vlead_ = 0;
+    std::vector<int32_t> mtp_vextra_;
+    std::vector<uint8_t> mtp_vin_;
+    void mtp_vocab_scan(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs);
 public:
     /// The NextN draft for the token after next: after forward() of position p, given the token chosen for p + 1,
     /// returns the block's greedy proposal for p + 2 (-1: no draft block).  Fills the block's caches at p.
@@ -572,6 +642,8 @@ public:
     double spec_dev_ms_ = 0, spec_gap_ms_ = 0;
     int64_t spec_dev_n_ = 0;
     float* kda_bak_ = nullptr;                             // the head's saved recurrent states
+    bool kda_bak_cur_ = false;   // win_commit_part left kda_bak_ equal to the live states (the next pipelined begin's
+                                 // backup is not needed)
     float* spec_hop_h_[2] = {nullptr, nullptr};            // pinned hop slots by position parity
     cudaEvent_t spec_ev_hop_[2] = {nullptr, nullptr};
     bool spec_kda_copy(bool restore);
@@ -586,6 +658,43 @@ public:
     bool hop_to_next(Glm5Model* B, int64_t p, std::string& err);
     bool spec_head(int64_t p, int32_t token, std::string& err);
     bool spec_tail(Glm5Model* head, int64_t p, std::string& err);
+    /// The one-GPU MTP decode (src/core/glm_mtp.cu): each round the NextN block drafts up to n tokens in a chain (its
+    /// own hidden state feeding the next step), one verify window (window()) checks [last token, drafts...], the
+    /// target's samples accept the drafts while they match (window_commit keeps them), and the NextN block's cache takes
+    /// the kept rows with the trunk's hidden states.  The same tokens the token-at-a-time loop gives for the same
+    /// samples.  On by default on the Strix / Gorgon Halo APUs (gfx115x, mtp_decode_default); STRATA_GLM_MTP_DECODE=1
+    /// elsewhere, =0 off.  mtp_ready(): this model was set up for it.
+    static bool mtp_decode_wanted(int dev, int n_parts);
+    bool mtp_ready() const;
+    bool decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                    int64_t& produced, std::string& err);
+    uint64_t mtp_rounds_ = 0;                              // verify passes (spec_steps_ / spec_hits_: drafts, accepted)
+    uint64_t mtp_round_n_[9] = {};                         // ... by the draft length the round used
+    bool mtp_fill_prev(int32_t token, int64_t p, std::string& err);   // the token path: entry p - 1 from head_x and token
+private:
+    bool mtp_dec_ = false;                                 // the one-GPU MTP decode is set up on this part
+    int64_t mtp_hx_pos_ = -1;                              // the position whose trunk hidden state head_x holds
+    // the adaptive draft length: per length n, the rounds' wall time (EMA, ms) and how many; per draft position, how
+    // often it was reached (its earlier drafts all accepted) and accepted - decayed counts, the recent text's
+    // (STRATA_GLM_MTP_ACC_WINDOW)
+    double mtp_ms_[9] = {};
+    uint64_t mtp_seen_[9] = {};
+    double mtp_reach_[9] = {}, mtp_hit_[9] = {};
+    uint64_t mtp_round_no_ = 0;
+    int mtp_best_ = -1;                                    // the length in use, the probe gap and the next probe
+    uint64_t mtp_gap_ = 32, mtp_next_probe_ = 0;
+    bool mtp_probe_up_ = false;
+    int mtp_stint_n_ = 0, mtp_stint_left_ = 0;             // a length's run of rounds (exploring, probing)
+    int mtp_prev_n_ = -1, mtp_same_ = 0;                   // the last round's length and the rounds of it in a row
+    double mtp_out_ = 0.0;                                 // the share of emitted tokens outside the draft vocabulary
+                                                           // (an EMA over ~64): above 2%, drafts take the whole head
+    int mtp_choose(int n_cap);
+    bool mtp_cache_setup(std::string& err);                // fast_setup: the cache fill's row buffers (kWinMax rows)
+    void mtp_cache_free();
+    // the NextN block's cache-writing half for n entries from p0: entry p0 + i from h + i * n_embd (device, this part)
+    // and the token next[i] - eh_proj, the attention norm, kv_a and the indexer's key/gate, no query, no FFN
+    bool mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err, bool sync = true);
+public:
     // ---- several conversations at once (src/core/glm_multi.cu, STRATA_GLM_SEQS=<n>): each part keeps n sequence
     // states (the state arena: residual, KDA states, DSA caches; the position, the snapshot) and binds one at a time -
     // every path that reads `state_` (the token path, the prompt path, snapshots, slots) then works on the bound one.
@@ -637,10 +746,22 @@ public:
     /// through the token path's own kernels, so each sequence gets the token the token path would give it.
     /// tokens_out[i]: sequence seqs[i]'s next token after tokens[i] (greedy, or sampled with sps[i]); every
     /// sequence's position advances by one.  n <= rows_max().
-    bool rows_ok() const { return rows_ != nullptr && split_next_ == nullptr && fast_ != nullptr; }
+    bool rows_ok() const { return rows_ != nullptr && n_parts_ == 1 && split_next_ == nullptr && fast_ != nullptr; }
     static int rows_max();
     bool multi_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
                     int* tokens_out, std::string& err);
+    /// LAYER SPLIT (glm_rows.cu): one token of each of n sequences through every part as one batched step per part,
+    /// queued like multi_issue (nothing waited for); multi_take(seqs[i]) returns each one's token.  n <= rows_max().
+    bool split_rows_ok() const;
+    bool multi_issue_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
+                          std::string& err);
+private:
+    struct RowSeq;
+    bool rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err);
+    bool rows_embed(const RowSeq* rw, const int32_t* tokens, int n, std::string& err);
+    bool rows_layers(RowSeq* rw, int n, std::string& err);
+    bool rows_head(const RowSeq* rw, const strata::kernels::SamplerParams* sps, int n, std::string& err);
+public:
     struct RowsState;
     RowsState* rows_ = nullptr;
     bool rows_alloc(std::string& err);                     // load, several sequences on one GPU: before the pool
@@ -669,9 +790,17 @@ public:
     /// `fresh`: it follows the previous window's late tokens without waiting for the devices), win_pipe_push each
     /// further token's (kPipeMax in all), win_pipe_pick(t) waits for the pick after token t; then win_pipe_settle
     /// (every part's share enqueued) before window_commit, or win_pipe_end (every pick, the devices drained)
-    static constexpr int kPipeMax = kWinMax / 2;
+    // (its tokens at most: the anchor and a DFlash block's 15 drafts; the rows a token crosses with alternate between two
+    // banks of kPipeMax, kPipeSlots in all - a window's token index stays below kWinMax, its KDA input rows')
+    static constexpr int kPipeMax = 16;
+    static constexpr int kPipeSlots = 2 * kPipeMax;
+    static_assert(kPipeSlots <= 64, "the head split's events (hh_ev_, ht_ev_)");
+    static_assert(kPipeMax <= kWinMax, "a pipelined token's KDA input rows are the window's");
     bool win_pipe_begin(int32_t first, std::string& err, const strata::kernels::SamplerParams* sp = nullptr,
                         bool fresh = true);
+    bool win_pipe_begin_part(bool fresh, std::string& err);   // a part's own share of win_pipe_begin
+    void win_commit_part(int n_keep);                          // ... and of window_commit
+    std::chrono::steady_clock::time_point win_pipe_begun_at(int k) const;
     bool win_pipe_push(int32_t token, std::string& err);
     bool win_pipe_pick(int t, int32_t& pick, std::string& err);
     bool win_pipe_settle(std::string& err);
@@ -686,7 +815,10 @@ public:
     void win_crew_stop();
     /// window_pipe's token t: KDA layer il's projections go to its window input rows (window_commit replays from them)
     void win_kda_rows(int il, int t, float** proj, float** fa, float** ga, float** beta);
-    bool window_commit(int n_keep, std::string& err);
+    // (wait = false, a pipelined window: the parts' commit enqueues are not waited for - the next window's begin is
+    //  queued behind each on its crew thread; win_commit_wait before anything else reads the state)
+    bool window_commit(int n_keep, std::string& err, bool wait = true);
+    void win_commit_wait();
     bool win_reserve(std::string& err);                    // the window's buffers and state backup, before the pool
     void win_prof_report();                                // STRATA_GLM_WIN_PROF: each part's window time, then reset
     // ---- the DFlash drafter (src/core/glm_dflash.cu): the part with the head holds it, on its device
@@ -739,11 +871,26 @@ public:
         size_t staging = 0, hop = 0;
     };
     PinnedPrompt prefill_pinned() const;
-    static size_t pool_avail(size_t free_b, size_t total_b, int dev = -1);  // the expert pool's bytes from free VRAM
-    static size_t pool_reserve(int dev);      // the free VRAM that sizing leaves the card (STRATA_GLM_RESERVE_MB)
-    static size_t mmq_scratch_reserve();      // ... of which the prompt path's MMQ scratch pool needs this much
-    // the slots a layer must keep while the pool lends the prompt path: one route's experts, the device's spares, +2
-    // (Strata's floor); STRATA_GLM_PREFILL_KEEP lowers it, never below route + spares
+    // the expert pool's bytes on part `part` from its free VRAM (glm_fast_path.cu): --expert-cache auto | N and the VRAM
+    // reserve (STRATA_GLM_EXPERT_CACHE, STRATA_GLM_RESERVE_MB / _RESERVE_LATER_MB; the driver sets them from the
+    // config's args).  floor_b: the pool's floor (a route's experts and the spares, every layer), which a small card's
+    // default reserve gives way to; slot_b: the part's largest expert slot (--expert-cache N is N of them)
+    struct PoolBudget {
+        size_t avail = 0, reserve = 0;
+        int64_t fixed = 0;              // --expert-cache N (the first GPU), 0: auto
+        bool reserve_given = false;     // a reserve set by hand is kept as it is
+        bool adapted = false;           // the default reserve lowered so the pool holds its floor
+    };
+    static PoolBudget pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b,
+                                  bool unified = false);
+    PoolBudget part_budget(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) const;   // ... less pool_short_
+    void pool_check(size_t floor_b, size_t slot_b, size_t all_b);   // auto: the budget written once, free VRAM read again
+    size_t pool_short_ = 0;                                // what that check found short of the reserve
+    PoolBudget pool_b_;                                    // the budget the pool was carved from
+    // the prompt path's own questions of the same numbers (glm_fast_path.cu): the MMQ scratch that the reserve carries
+    // (it is subtracted from the pool's budget), and the slots a layer must keep while the pool lends the prompt path
+    // (one route's experts, the device's spares, +2 - STRATA_GLM_PREFILL_KEEP lowers it, never below route + spares)
+    static size_t mmq_scratch_reserve();
     static int pool_keep(int n_exp_used);
     bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder

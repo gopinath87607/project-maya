@@ -4,6 +4,247 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.16 - 2026-10-19
+
+DeepSeek-V4.1-Flash-1017 on Maya: Project Maya's own quant of the 748B model, on NVIDIA and AMD, Linux and Windows,
+with any amount of memory.
+
+- **DeepSeek-V4.1-Flash-1017.** The setup now asks which model to run: GLM-5.3-Flash as before, or DeepSeek's 748B
+  model on an engine of its own (`maya-ds4`): its sliding-window and compressed sparse attention with the two-level
+  indexer, hyper-connections, the Engram n-gram tables, the DSpark drafter and the vision tower.
+- **Maya-S, Project Maya's own quant of it** (the default, `--ds4-quant maya-s`): the routed experts in 2-3 bits with
+  error-feedback rounding, the attention, shared experts and dense weights in 8-bit - 178 GB, plus DeepSeek's Engram
+  tables (203 GB, read a few rows a token from the SSD). It picks the same next token as the original model 92.6% of
+  the time. [On Hugging Face](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF).
+- **Or unsloth's GGUFs** (`--ds4-quant gguf-q8` / `gguf-q4`: DeepSeek's own formats, 508 / 501 GB), **or LibertAIDAI's
+  EXL3 quant** at 2.9 bits (`--ds4-quant exl3`; RTX 30 / A100 or newer; its basic path: #271 by @needmorevram).
+- **Big models, little memory:** the most-used experts go to the GPUs, the others are read in place from the model's
+  files - from RAM where they fit, from the SSD otherwise. Keep the files on an NVMe SSD. Runs from NVIDIA Volta
+  (V100) on and on AMD (RX 7900, Radeon AI PRO R9700 / RX 9070, Strix Halo / Gorgon Halo).
+- **The DSpark drafter:** the setup fetches the model's drafter (8 GB, from Maya's repo: DeepSeek's FP4 experts, its
+  dense weights in 8-bit) and a speed calibration keeps it only on PCs where drafting makes answers faster.
+- **Pictures:** with the GGUFs the setup fetches DeepSeek's vision tower (1 GB of its checkpoint); it runs on the
+  first GPU in about 320 MB, on NVIDIA and AMD.
+- **Several GPUs:** the layers are split across them; pairs of equal GPUs also split each layer where the files'
+  formats allow.
+- **Fast prompts:** a prompt streams only the experts it picks, read from the SSD side by side, and short prompts take
+  whichever path is faster on the PC.
+- **The attention caches as DeepSeek stores them:** the compressed cache and the index keys in FP4, the sliding window
+  in FP8 - 3.5x smaller, the same answers, faster prompts, and more experts fit in VRAM at long contexts.
+- **A faster CPU lane:** the experts the CPU computes use 8-bit integer dot products (AVX2, AVX-VNNI, AVX-512), each
+  CPU picking its fastest; the results are the same on every one.
+- **Windows on a Strix Halo / Gorgon Halo:** Windows counts the GPU's share of the memory against its page file. The
+  setup asks for a page file big enough to keep every expert on the GPU and says the size; without it the engine keeps
+  fewer experts there and never starves other programs (docs/AMD_MAYA.md).
+- **The dashboard and the Chat per model:** with DeepSeek, the Monitor shows its own numbers (experts on the GPU and
+  the CPU, SSD reads, the cache's moves, the n-gram memory), the Chat's thinking levels are DeepSeek's (Off, Low,
+  High, Max) with its recommended settings, and each model keeps its own saved settings.
+- **Model downloads that keep going:** four files at a time, each resumed where it stopped, and run again on its own
+  when the connection drops or stalls.
+- **GLM-5.3-Flash:** the expert usage record is saved on Windows again (it stopped updating after the first save
+  there).
+- **Name scope adjustments:** the programs and settings follow Maya's name; existing installs and settings keep
+  working and are carried over at their next start.
+
+## v1.1.15 - 2026-10-16
+
+Faster EXL3 drafting across many GPUs, faster long prompts on V100s, a faster CPU lane on Zen 5, and EXL3 on AMD
+(experimental).
+
+- **EXL3 with DFlash2 on many GPUs, faster** (#225 by @needmorevram). Pipelined verify rounds, decode's attention on
+  the tensor cores (RTX 30 series and newer) and a shorter drafter chain. On an RTX 3090 + 8x RTX 5060 Ti with
+  EXL3-4.05bpw and DFlash2: decode 71 -> 81 tokens/s greedy, 69 -> 79 sampled, 46 -> 59 on 32K-token documents - the
+  same tokens with drafts as without. Every part has a setting to turn it off (docs/SETTINGS.md).
+- **Long prompts faster on Tesla V100 and RTX 20** (#196 by @merbanan). Their prompt attention runs in two passes with
+  32 heads a block: on one V100, a 27K-token prompt's attention went from 22.5 to 11.8 s and the whole prompt from 78.4
+  to 67.9 s. `STRATA_GLM_PREFILL_ATTN=tc` keeps the previous kernel.
+- **A faster CPU lane on CPUs with AVX-512 VBMI** (#227 by @cryptedy). Where the CPU computes Maya-S / Maya-S24's
+  experts, CPUs with AVX-512 VBMI (Zen 4, Zen 5, Xeons from Ice Lake on) use new rows that give exactly the same
+  results: decode +6-8% on a Zen 5. Other CPUs are unchanged.
+- **EXL3 on AMD GPUs, experimental** (#186 by @izabera). The setup offers turboderp's EXL3 quants with AMD GPUs too;
+  the EXL3 kernels pass their tests on an RX 7900 XTX and a Radeon 8065S. Their speed on AMD is not tuned yet.
+- **DFlash2 on a V100 with little free VRAM** (#195 by @merbanan). The drafting windows failed with "out of memory"
+  once the expert pool had taken the VRAM down to a few hundred MB; they run now.
+- **Skipping light experts, opt-in** (#228 by @cryptedy). `STRATA_GLM_MISS_SKIP_W` / `_FROM` leave out a routed expert
+  that is not in VRAM and carries little of the route's weight - faster on RAM-bound PCs, but it changes the answers,
+  so it is off by default.
+- **Smaller changes:** the setup picks AMD on a first run on a PC with only supported AMD GPUs (#190 by @thomas9120);
+  the image encoder skips its warm-up when it runs on the CPU (#184 by @izabera); docs/SETTINGS.md explains how to get
+  the same answers after a restart with the CPU lane on (#224 by @hiroki-abe-58).
+
+NVIDIA GPUs give v1.1.14's tokens with `STRATA_GLM_PREFILL_ATTN=tc`, `STRATA_GLM_DSA_ALL=0` and `STRATA_GLM_MLA_MMA=0`.
+As shipped, three faster paths add the same numbers up in another order, so an answer can differ from v1.1.14's in
+places: prompts on V100 and RTX 20 (#196), decode on RTX 30 and newer (#225), and conversations under 2048 tokens on
+any GPU (#225; `STRATA_GLM_DSA_ALL=0` on AMD too). Otherwise AMD GPUs give v1.1.14's tokens.
+
+## v1.1.14 - 2026-10-16
+
+NVIDIA Pascal cards as experimental, and unsloth's Q6_K_XL / Q8_0 GGUFs of GLM-5.3-Flash.
+
+- **NVIDIA Pascal, experimental** (#214 by @Jw88888, #212). The engine builds for compute capability 6.x - Tesla P40
+  / P100, GTX 10 - and the setup accepts these cards, with a note that Maya has not been validated on them yet. On
+  Pascal the engine caches global loads in L1 (`-Xptxas -dlcm=ca`), which its decode needs there: two Tesla P40s
+  decode Maya-S24 at 28 tokens/s, with the same answers. Like the V100, Pascal needs CUDA 12.x.
+- **unsloth's Q6_K_XL and Q8_0 GGUFs** (#216 by @Xar1c). unsloth's UD-Q6_K_XL and Q8_0 quants of GLM-5.3-Flash keep
+  some layers' routed experts at Q8_0, and the engine stopped at start with `unresolved weights`. They run now.
+
+NVIDIA GPUs of compute capability 7.0 and newer give v1.1.13's tokens.
+
+## v1.1.13 - 2026-10-16
+
+Faster decode where experts are fetched, a fix for long prompts on a Windows Strix Halo, a new chat with the same system
+prompt reusing it, two kinds of AMD GPU together, AMD RDNA 2 builds and the current GLM-5.3-Flash chat template.
+
+- **The expert spares keep what you used last** (#210 by @saatvik-viniak). With one conversation, when the GPU makes
+  room for a fetched expert it now evicts the one used least recently, instead of the least used by the aged counts -
+  those keep experts that were busy earlier in the chat. On 3x Tesla V100 16 GB with Maya-S at 128K: decode 24.8 ->
+  26.5 tokens/s. With several conversations at once (`--parallel`) the old rule stays: there the recency let the latest
+  conversation's experts push out what all of them use. `STRATA_GLM_VRAM_EVICT=lru` / `least` chooses either.
+- **Long prompts on a Windows Strix Halo with a smaller GPU share** (#206). Under Windows, HIP counts a Ryzen AI Max's
+  GPU memory as its dedicated share plus ~12 GB of shared system memory, and since v1.1.10 the expert pool could fill
+  past the dedicated share into the shared part, which Windows pages - on a 96 GB share, 8K-token prompts were read at
+  62 tokens/s instead of v1.1.9's 159. The pool now stays within the dedicated memory Windows reports for the GPU, and
+  the engine's log says so at start. A share the model fits in (160 GB on a Radeon 8065S) is unchanged.
+- **A new chat with the same system prompt reuses it** (#179). With the conversation slots on (the default), the end of
+  a long system prompt is also set aside on disk, so another chat that starts with it - even after an unrelated
+  conversation in between - reads only its own part instead of the whole system prompt again.
+- **Two AMD GPUs of different kinds, and an experimental expert helper** (#201 by @zhedang). The setup accepts a
+  discrete AMD GPU together with a Ryzen AI Max APU (the discrete one first). `STRATA_GLM_EXPERT_HELPER=1` makes the
+  second GPU a helper that holds a share of the experts and computes them, instead of splitting the layers - see
+  [the AMD guide](docs/AMD_MAYA.md#experimental-expert-helper).
+- **Faster prompts on Strix Halo with ROCm 10** (#203 by @boxwrench). A tuning table for hipBLASLt 100500 (TheRock /
+  ROCm 10): on a Radeon 8060S under Linux, prefill 204 -> 341 tokens/s at 2K tokens, 217 -> 373 at 8K.
+- **AMD RDNA 2 builds** (#205). v1.1.12's experimental RX 6800 / 6900 and Radeon PRO V620 / W6800 (`gfx1030`) support
+  now compiles: AMD's rocWMMA library, which knows only newer GPUs, is left out there.
+- **The current GLM-5.3-Flash chat template.** zai-org updated it on 15 October: tool results are matched to their
+  calls far faster. The server now renders with it instead of the older copy inside the model files - the same prompts
+  (288 test conversations, byte for byte), and a chat with many tool calls is prepared up to ~15x faster. Nothing is
+  downloaded again.
+
+NVIDIA GPUs give v1.1.12's tokens with `STRATA_GLM_VRAM_EVICT=least` and with several conversations at once.
+With one, the new rule keeps other experts in VRAM, and where the CPU computes the rest an answer can differ
+from v1.1.12's in places.
+
+## v1.1.12 - 2026-10-15
+
+EXL3 on one GPU with the CPU's help, batched answers across a layer split (opt-in), the VRAM tier following the
+conversation while DFlash2 drafts, and AMD RDNA 2 cards as experimental.
+
+- **EXL3 on one GPU: the CPU takes more of the experts, faster** (#188 by @needmorevram). On one GPU most of an EXL3
+  model's experts run on the CPU. The CPU now reads each expert in memory order (split-K pieces) and runs a route's
+  experts as one batch of jobs, and CPUs without AVX-512 (Intel desktop chips, Zen 2 and 3) get an AVX2 tier of their
+  own. Prompts give their least-used experts to the CPU too, as GGUF prompts already did. On an RTX 3090 alone:
+  EXL3-3.05bpw decode 14.3-16.8 -> 20.9-22.1 tokens/s, 22.4 -> 29.2 with DFlash2; EXL3-4.05bpw 14.4-15.1 -> 18.9-19.6;
+  an 8K prompt 384-396 -> 422-489 tokens/s. The answers are the same tokens as before.
+- **Batched answers across a layer split, opt-in** (#204 by @zetlaw). With `STRATA_GLM_SPLIT_ROWS=k` (1-8) and several
+  requests at once, each GPU of a split takes up to k requests in one step, reading the shared weights once for all of
+  them. On four RTX 4000 Ada GPUs with Maya-M and eight requests, `k=2` gave 94.5 tokens/s in all against 74.4 (+27%);
+  larger groups were slower there, so it stays off by default. See
+  [several requests at once](docs/SETTINGS.md#several-requests-at-once).
+- **The VRAM tier keeps following the conversation while DFlash2 drafts** (#198 by @merbanan). With the drafter's
+  verify window on two CPU lanes, the background swaps that move the experts you use into VRAM had stopped. They run
+  again: on a V100 with a Ryzen 9 7950X, the share of experts found in VRAM went from 49-62% to 54-67%.
+- **AMD RDNA 2, experimental** (#205). The setup accepts the RX 6800 / 6900 series and the Radeon PRO V620 / W6800
+  (`gfx1030`), and compiles for them only when one is chosen. Maya has not been validated on such a card yet: please
+  tell us how it goes in an issue.
+
+NVIDIA GPUs give v1.1.11's tokens.
+
+## v1.1.11 - 2026-10-15
+
+What fills each GPU, in the Monitor, and the expert pool's size as a setting in the config.
+
+- **The Monitor shows what fills each GPU** (#191 by @needmorevram). The GPUs table becomes a card with a bar for each
+  GPU: the model's weights, the KV cache, the activations, a drafter and its verify window, the expert pool, CUDA and
+  the rest, other programs and the free memory, with that GPU's load, power, temperature and PCIe link under its bar.
+  Pointing at a part picks it out in every bar; a click opens a GPU's row with a sentence for each part, and the advice
+  names the GPU (other programs holding memory that a restart would give to the expert pool, say). On two Tesla V100s
+  the parts add up to what the NVIDIA driver reports for each card; on AMD, where the driver does not list the memory a
+  process holds, the card shows the engine's own measurement at its start.
+- **The expert pool's size in the config** (#192 by @needmorevram). `--expert-cache auto`, the default the setup now
+  writes, sizes the pool from the free VRAM less a reserve as before, and then checks that budget once it is written:
+  under Windows the free figure read before an allocation can run about a gigabyte high, and a card filled past it
+  pages GPU memory to system RAM, where decode runs several times slower. Short of the reserve, the pool gives back the
+  difference. `--expert-cache N` caps the first GPU's pool at N experts; `--vram-reserve-mib N` (and
+  `--vram-reserve-later-mib N` for a split's later GPUs) sets the reserve. At start the log says how much VRAM each GPU
+  has free with everything loaded, and warns when it is low. The check is left out on the Ryzen AI Max APUs and where
+  the free VRAM is far beyond what the pool can take.
+
+NVIDIA GPUs give v1.1.10's tokens, and the Ryzen AI Max APUs keep v1.1.10's speed.
+
+## v1.1.10 - 2026-10-14
+
+The Strix Halo and Gorgon Halo release: faster answers and faster prompts on the Ryzen AI Max APUs, a faster cold start
+from a hard disk, and prompts through both links of an NVLink pair.
+
+- **Strix Halo and Gorgon Halo: faster answers.** On the Ryzen AI Max APUs (Radeon 8050S / 8060S / 8065S, `gfx115x`),
+  answers come faster with the same text. On a Gorgon Halo (Radeon 8065S, Ryzen AI Max+ PRO 495 with 192 GB, 160 GB of
+  it for the GPU, which holds all of Maya-S; Windows 11), 256-token answers to short prompts run at 28.4-29.6 tokens/s
+  instead of 19.7, and at 23.2-23.5 instead of 18.4-18.5 after 3K- and 8K-token prompts; longer answers (about 600
+  tokens) hold 26.3 and 23.4. It is on by default on these APUs only; every other GPU decodes as in v1.1.9. A 128 GB
+  Strix Halo, whose GPU holds less of the model, is not measured yet. `STRATA_GLM_MTP_DECODE=0` turns it off, `1` tries
+  it on one GPU elsewhere (usually slower where experts stream from RAM); it stays off with `--parallel` or a DFlash2
+  drafter. Thanks to @boxwrench for testing on a Strix Halo.
+- **Every expert stays in GPU memory where it fits** (#101). Where the GPU's budget holds every expert plus the room a
+  prompt borrows (a 192 GB Gorgon Halo under Windows), the start loads all of them, and a long prompt no longer moves
+  experts out to read them back from the SSD: answers after an 8K-token prompt +7%. On by default on AMD
+  (`STRATA_GLM_COMPLETE_POOL`, `STRATA_GLM_RESIDENT_SKIP`); NVIDIA keeps its pool unless they are set to `1`.
+- **Faster prompts on Strix Halo and Gorgon Halo** (#98 and #113 by @boxwrench). A prompt's routed experts run in one
+  fused int8 pass, and the wave32 WMMA attention is the default on `gfx1151`: on the Radeon 8065S, 3K- and 8K-token
+  prompts read at 271 and 278 tokens/s instead of 233 and 253. `STRATA_GLM_PREFILL_FUSED=0` and
+  `STRATA_GLM_PREFILL_ATTN=f16q` give the old paths.
+- **A faster cold start from a hard disk** (#182 by @hmartiniano). The start reads a GGUF pack's experts in the order
+  they lie in its files, as it already did for EXL3, instead of the order the routes rank them, so a hard disk reads
+  them in one pass instead of seeking from one to the next; how much faster depends on the disk. Which experts go to
+  VRAM and RAM is unchanged.
+- **Two GPUs over NVLink: prompts through both links** (#121 by @q8atnight). With `STRATA_GLM_DUAL_PREFILL=1`, in a
+  prompt of one chunk the waiting GPU stages every second expert over its own PCIe link and NVLink (Maya-M on two RTX
+  3090 with NVLink: 1K- and 4K-token prompts +28% and +24%). The start checks that peer copies arrive intact and keeps
+  it off on a machine whose GPUs report peer access but deliver wrong bytes.
+
+## v1.1.9 - 2026-10-14
+
+EXL3 decodes on the tensor cores of RTX 30 and newer, EXL3 prompts are faster, and turboderp's 4.05-bit EXL3 quant is
+in the setup.
+
+- **EXL3 decode on the tensor cores** (#180 by @needmorevram). On RTX 30 and newer each 16 x 16 tile of an EXL3
+  weight is decoded straight into a tensor-core product, up to 8 tokens at once: the expert kernels run about 1.8x as
+  fast on an RTX 3090 and an RTX 5060 Ti, and decode is 14-30% faster on an RTX 3090 + eight RTX 5060 Ti
+  (EXL3-4.05bpw, with the MTP block and with DFlash2). The answers are not bit for bit v1.1.8's there: the sums run in
+  the tensor cores' order. NVIDIA GPUs before RTX 30 (V100, T4, RTX 20) keep v1.1.8's decode kernels, which are faster
+  there - the same speed and output as v1.1.8. `STRATA_GLM_EXL3_DECODE=legacy` or `new` picks one on any GPU.
+- **EXL3 prompts rotate the rows, not the weights** (#180). An expert that goes through cuBLAS has its rows of tokens
+  rotated instead of its whole weight, so the weight is only decoded: an 8K prompt +6% on the nine GPUs above, +3% on
+  a V100. `STRATA_GLM_EXL3_ROT=0` gives the old path.
+- **EXL3-4.05bpw in the setup** (#180). turboderp's quant at 4.05 bits per weight (`--model EXL3-4.05bpw`, 165.2 GB
+  with the MTP block): 4-bit routed experts and mostly 6-bit dense weights. Experimental and NVIDIA only, like the
+  3.05-bit one; every file is checked against its sha256.
+- **The layer split for EXL3 packs** (#180). `--layer-split auto` assumes flatter routes for an EXL3 pack (its experts
+  are bigger, so a card holds fewer of a layer's): over an RTX 3090 and eight RTX 5060 Ti with DFlash2, the 3090 takes
+  9 layers instead of 7 and decode is 24-27% faster. GGUF packs split as before.
+
+## v1.1.8 - 2026-10-14
+
+Contributors' fixes and additions: speculative sampling on Turing cards, AMD's tuning table for the installed library,
+prompt-reading progress on the stream, and tool calls with templates that open thinking only when asked.
+
+- **Speculative sampling on Turing cards** (#161 by @sociolog). With `STRATA_GLM_SPEC_SAMPLE=1`, its draft kernel
+  needed more registers than a Turing card (RTX 20, T4) has for a block of 1024 threads, and the launch failed wherever
+  the MTP block sat on such a card. The kernel is now bounded to fit; other cards run it as before.
+- **AMD: the tuning table for the installed hipBLASLt** (#162 by @Tsury, #158). The setup passes every prompt tuning
+  table made for the card's architecture, and the engine takes the one made for the installed hipBLASLt version.
+  Before, it passed only the newest, and a PC with another library version fell back to plain hipBLAS. A Strix Halo
+  (gfx1151) table for hipBLASLt 100401 is added: on @Tsury's Linux PC with that library, a tool-calling session's
+  prompts took 29 s instead of 52 s.
+- **Prompt progress on the stream** (#163 by @eliaskg). A streamed chat request with `"return_progress": true` gets
+  `prompt_progress` chunks (`total`, `cache`, `processed`, `time_ms`) while a long prompt is read, so a client can draw
+  a progress bar. Nothing changes unless a request asks; non-streamed requests and the Anthropic API are as before.
+- **Tool calls with templates that open thinking only when asked** (#148 by @beverm2391). With Max thinking, a model
+  whose chat template opens `<think>` only when `enable_thinking` is true returned its tool calls inside the reasoning
+  text. The template now gets the thinking default the reply parser assumes. Maya's GLM template renders as before.
+- **Docs:** the CPU image encoder with the AMD engine on Linux, set up by hand (#159 by @Tsury); what to install when
+  the CUDA profiler or NVTX headers are missing (#160 by @Tsury).
+
 ## v1.1.7 - 2026-10-13
 
 Faster prompts with the INT8 cache, Windows fixes for speed in the background and for the RAM tier, and a guard

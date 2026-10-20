@@ -8,9 +8,10 @@ non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, G
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
-data, http(s) URLs or local file paths) go through `strata-vision` (the model's mmproj file) and reach the engine as
+data, http(s) URLs or local file paths) go through `maya-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
-converted to PNG first with Pillow.
+converted to PNG first with Pillow.  DeepSeek-V4.1 (maya-ds4, `INFO vision=ds4`) runs its vision tower in the engine:
+the server only resizes the pictures (serve/ds4_vision.py) and sends their pixels with `GENI`.
 Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
@@ -48,11 +49,13 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+from serve import ds4_vision, gpu_map  # noqa: E402
 from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             effort_kwargs, effort_level, images_of, literal_tags, mark_literals,
                             openai_to_messages, unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.update import Updater  # noqa: E402
+import maya_names  # noqa: E402  (tools/) the settings' names users see (MAYA_*) and the older ones the code reads
 
 try:                        # Project Maya's release (the dashboard's About; the engine's INFO carries none)
     MAYA_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip() or None
@@ -429,8 +432,9 @@ class StrataEngine:
         self._tls = threading.local()                   # the request this thread is generating (pause())
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
+        self.vram = []                   # VRAM lines: what each part holds on its GPU (the Monitor's GPU map)
         self.prefill_tok_s_mean = None
-        self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
+        self.progress = None             # (read, total, reuse, ms) prompt progress while a prompt is read, from PP lines
         try:                             # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
@@ -442,6 +446,10 @@ class StrataEngine:
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
                     self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+            if line.startswith("VRAM "):
+                part = gpu_map.parse(line)
+                if part:
+                    self.vram.append(part)
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -668,6 +676,12 @@ class StrataEngine:
             rc = tune.get("read_chunks")   # ... and the pieces it reads an expert from the SSD in (x3)
             if isinstance(rc, int) and not isinstance(rc, bool) and 1 <= rc <= 16:
                 tune_keys += f" read_chunks={rc}"
+            mw = tune.get("miss_skip_w")   # the GLM engine's light-miss bar (STRATA_GLM_MISS_SKIP_W) for this request
+            if isinstance(mw, (int, float)) and not isinstance(mw, bool) and 0.0 <= float(mw) <= 1.0:
+                tune_keys += f" miss_skip_w={float(mw)!r}"
+            mf = tune.get("miss_skip_from")   # ... and its first layer (STRATA_GLM_MISS_SKIP_FROM)
+            if isinstance(mf, int) and not isinstance(mf, bool) and 0 <= mf <= 1000:
+                tune_keys += f" miss_skip_from={mf}"
             sw = tune.get("spec")   # the GLM engine's DFlash decode: its verify window (the anchor and drafts), 2..16;
             if isinstance(sw, int) and not isinstance(sw, bool) and 1 <= sw <= 16:   # 1: no drafting (the token loop)
                 tune_keys += f" spec={sw}"
@@ -771,7 +785,13 @@ class StrataEngine:
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                        self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
+                        # (read, total, reuse, ms): prompt progress, one per chunk: also a heartbeat (the
+                        # lines reset the 10 s wait, so without this a long prompt would send no keep-alives at all).
+                        # `reuse` (engines that print the field): what the conversation cache already held,
+                        # `ms` the prompt read's own clock - both go to the stream's prompt_progress
+                        self.progress = (int(f[1]), int(f[2]),
+                                         int(f[5]) if len(f) >= 6 and f[5].isdigit() else 0,
+                                         float(f[3]) if len(f) >= 4 else 0.0)
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
@@ -878,7 +898,9 @@ class StrataEngine:
                     yield int(f[2])
                 elif line.startswith("PP "):
                     if len(f) >= 4 and f[2].isdigit() and f[3].isdigit():
-                        self.progress = (int(f[2]), int(f[3]))
+                        self.progress = (int(f[2]), int(f[3]),
+                                         int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
+                                         float(f[4]) if len(f) >= 5 else 0.0)
                         self.prefill_tok_s_mean = float(f[5]) if len(f) >= 6 else None
                     if cancel.is_set():
                         return
@@ -962,7 +984,7 @@ class StrataEngine:
 
 
 class Vision:
-    """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
+    """The resident image encoder: `maya-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
     sends the same picture again (every turn, with most clients) encodes it once.
 
@@ -983,7 +1005,7 @@ class Vision:
         if cfg.get("no_flash_attn"):   # GLM-5.3's encoder on a GPU: full-precision attention (cosine 0.9997 vs 0.999)
             args.append("--no-flash-attn")
         self.args, self.log, self.env = args, log, env
-        self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
+        self.dir = Path(tempfile.mkdtemp(prefix="maya-vision-"))
         self.proc = None
         self.lend = self.reclaim = None   # on demand: callables (the engine's VLEND / VRECLAIM), wired by main()
         self.owed = False                 # the engine's memory is not back yet (a reclaim that kept failing)
@@ -1054,7 +1076,7 @@ class Vision:
         if source.startswith("data:"):
             return base64.b64decode(source.split(",", 1)[1])
         if source.startswith(("http://", "https://")):
-            req = urllib.request.Request(source, headers={"User-Agent": "strata"})
+            req = urllib.request.Request(source, headers={"User-Agent": "maya"})
             with urllib.request.urlopen(req, timeout=60) as r:
                 return r.read()
         path = source[7:] if source.startswith("file://") else source
@@ -1064,7 +1086,7 @@ class Vision:
 
     @staticmethod
     def normalize(data: bytes) -> bytes:
-        """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG."""
+        """The formats maya-vision's decoder (stb_image) reads pass through; anything else is converted to PNG."""
         if data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
                 data[:6] in (b"GIF87a", b"GIF89a"):
             return data
@@ -1127,7 +1149,7 @@ class Vision:
 
 def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple[int, int] | None:
     """(image token cap, bytes) for the on-demand vision encoder on THIS machine's first GPU: measured once by
-    `strata-vision --measure` (before the model loads, so the GPU is otherwise idle) and cached per encoder file, cap
+    `maya-vision --measure` (before the model loads, so the GPU is otherwise idle) and cached per encoder file, cap
     and GPU.  A cap the config does not set is the largest of 4096 / 2048 / 1024 image tokens whose footprint stays
     within 15% of the card (a 32 GB card keeps 4096, an 8-12 GB card gets 1024).  None: no GPU to measure on, or
     no measurement (the encoder failed or printed no well-formed MEM line)."""
@@ -1314,10 +1336,13 @@ class Service:
         # GLM ends an assistant turn with the next role's token (<|user|> / <|observation|>): the engine stops on it,
         # and it must not reach the answer's text either
         self.stop_ids = set(_special_ids(IM_END) + _special_ids("<|endoftext|>") + _special_ids("<|user|>") +
-                            _special_ids("<|observation|>"))
+                            _special_ids("<|observation|>") +
+                            # DeepSeek-V4.1 ends a turn with its EOS (and would start the next with <｜User｜>)
+                            _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>"))
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
-        self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>") if _special_ids(s)]
+        self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>", "<｜end▁of▁sentence｜>", "<｜User｜>")
+                           if _special_ids(s)]
         # the thinking budget (run config `thinking_budget`, tokens; 0 = none): a reasoning block that reaches it is
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
         self.think_budget = 0
@@ -1508,7 +1533,7 @@ class Service:
             try:
                 cfg = json.loads(Path(self.config_path).read_text(encoding="utf-8-sig"))
                 secret = re.compile(r"key|token|secret|password", re.I)
-                env = {k: ("***" if secret.search(k) else v) for k, v in (cfg.get("env") or {}).items()}
+                env = {maya_names.shown(k): ("***" if secret.search(k) else v) for k, v in (cfg.get("env") or {}).items()}
                 out.append(f"Config: {Path(self.config_path).name}: args {' '.join(map(str, cfg.get('args') or []))}; "
                            f"gpu {cfg.get('gpu')}; env {json.dumps(env)}")
             except (OSError, ValueError):
@@ -1598,7 +1623,7 @@ class Service:
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
-            live["prompt_read"], live["prompt_total"] = progress
+            live["prompt_read"], live["prompt_total"] = progress[0], progress[1]
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
                   "trained_context": self.trained_context}
@@ -1611,11 +1636,28 @@ class Service:
         if stat:
             sh = list(getattr(self.engine, "stat_history", []) or [])
             tiers = {"now": stat, "history": {k: [s.get(k) for s in sh] for k in
-                                              ("tok_s", "ms_tok", "vram_hit", "ram_fetch", "disk", "promo")}}
-        return {"engine": engine, "live": live, "tiers": tiers, "requests": hist[::-1][:None if all_requests else 12],
-                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+                                              ("tok_s", "ms_tok", "vram_hit", "ram_fetch", "disk", "promo",
+                                               "cpu", "ram", "disk_mb", "engram_ms")}}   # (the last four: DeepSeek's)
+        hw = dict(tel["now"])
+        cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
+        return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": self._gpu_map(cards),
+                "requests": hist[::-1][:None if all_requests else 12],
+                "requests_kept": len(hist), "totals": totals, "hardware": hw,
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": self.storage()}
+
+    def _gpu_map(self, cards):
+        """What fills each GPU (serve/gpu_map.py): the engine's VRAM lines and NVML's cards, with the engine's and the
+        vision encoder's processes told apart from other programs; None for an engine without VRAM lines."""
+        report = getattr(self.engine, "vram", None)
+        if not report:
+            return None
+        proc = getattr(self.engine, "proc", None)
+        v = self.vision
+        vproc = getattr(v, "proc", None) if v is not None else None
+        lent = v is not None and getattr(v, "lend", None) is not None and (vproc is not None or getattr(v, "owed", False))
+        return gpu_map.view(report, cards, proc.pid if proc is not None else None,
+                            vproc.pid if vproc is not None else None, lent)
 
     # the GLM engine's live STAT values (StrataEngine._parse_stat) exported as gauges: key -> help
     PROM_STAT = {"tok_s": "Decode rate over the running request, tokens/s",
@@ -1623,6 +1665,9 @@ class Service:
                  "ram_fetch": "Experts a token read from the RAM tier",
                  "disk": "Experts a token read from the SSD",
                  "promo": "Experts a token promoted into VRAM",
+                 "cpu": "Experts a token computed on the CPU lane (DeepSeek)",
+                 "disk_mb": "MB a token the storage read (DeepSeek, Linux)",
+                 "engram_ms": "The n-gram memory's (Engram) read time a token, ms (DeepSeek)",
                  "vram_used": "Expert slots in use in VRAM", "vram_slots": "Expert slots in VRAM",
                  "ram_used": "Expert slots in use in RAM", "ram_slots": "Expert slots in RAM"}
 
@@ -1675,14 +1720,21 @@ class Service:
         busy, ctx = bool(s.get("busy")), self.engine.max_context
         images = self.vision is not None
         return {
-            "service": "strata", "model": self.model,
+            "service": "maya", "model": self.model,
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
             "concurrency": {"serving": places, "requested": places},   # more than that wait their turn
             "dialects": ["/v1/chat/completions", "/v1/messages"],
-            "vision": {"enabled": images, "available": images, "error": None},
+            "vision": {"enabled": images, "available": images,
+                       "error": None if images or (getattr(self.engine, "info", {}) or {}).get("vision") != "off"
+                       else "the model's vision tower did not load (the server's log says why)"},
+            # (DeepSeek on a Windows APU: Windows' commit - the page file - kept experts off the GPU; the NOTE says so)
+            "memory_note": (lambda i: None if not i.get("gpu_commit_capped_gb") else
+                            f"{i['gpu_commit_capped_gb']} GB of experts stay off the GPU: Windows' page file is too small; "
+                            f"a page file of {i.get('pagefile_hint_gb')} GB keeps them on the GPU")(
+                                getattr(self.engine, "info", {}) or {}),
             "activity": {"requests": totals["requests"] + max(int(busy), active),
                          "in_flight": max(int(busy), active) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
@@ -1707,14 +1759,24 @@ class Service:
             kwargs = {**kwargs, **effort_kwargs(self.default_effort)}   # the run config's thinking level
         prefill = ""
         if force is not None and tools:
-            # GLM's form opens with the tool's name, Qwen's with <function=NAME>
+            # GLM's form opens with the tool's name, Qwen's with <function=NAME>, DeepSeek's DSML with its calls block
             glm_calls = "<arg_key>" in self.template.source
-            prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
+            if getattr(self.template, "deepseek", False):
+                prefill = "\n\n<｜DSML｜ calls>\n" + (f'<｜DSML｜ invoke name="{force}">\n' if force else "")
+            else:
+                prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
         ids = self.render_ids(messages, tools, kwargs, prefill)
         self.embeddings.path = None
         images = images_of(messages)
-        if images:
+        if images and isinstance(self.vision, ds4_vision.Vision):
+            # DeepSeek: the engine encodes the pictures itself; each placeholder the template wrote (user text's are
+            # plain text, see render_ids) becomes its picture's span, the resized pixels go in the GENI file
+            pics = [self.vision.picture(src) for src in images]
+            ids, starts = self.vision.expand(ids, pics)
+            self.embeddings.path = self.vision.write(self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.dsi", pics,
+                                                     starts)
+        elif images:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
@@ -1775,9 +1837,16 @@ class Service:
             tools = (tools or []) + self.mcp.template_tools(exclude=own) or None
         if self.default_effort and "reasoning_effort" not in kw and "enable_thinking" not in kw:
             kw = {**kw, **effort_kwargs(self.default_effort)}
-        images = len(images_of(messages))
-        return {"tokens": len(self.render_ids(messages, tools, kw)), "images": images,
-                "approximate": images > 0, "max_context": self.engine.max_context}
+        sources = images_of(messages)
+        n, approximate = len(self.render_ids(messages, tools, kw)), len(sources) > 0
+        if sources and isinstance(self.vision, ds4_vision.Vision):   # (DeepSeek: a picture's span is its resize's)
+            try:
+                n += sum(self.vision.picture(src).tokens - 1 for src in sources)
+                approximate = False
+            except (ValueError, OSError):
+                pass
+        return {"tokens": n, "images": len(sources), "approximate": approximate,
+                "max_context": self.engine.max_context}
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -1927,7 +1996,8 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
+                              dsml=getattr(self.template, "deepseek", False))
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"
@@ -2009,7 +2079,9 @@ class Service:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
                             last_print = self._progress(last_print)
-                            yield "ping", None
+                            pr = getattr(self.engine, "progress", None)   # (read, total, reuse, ms), the PP parse
+                            yield "ping", ({"total": pr[1], "cache": pr[2], "processed": pr[0],
+                                            "time_ms": round(pr[3])} if pr and len(pr) >= 4 else None)
                             continue
                         n += 1
                         if my_first is None:
@@ -2303,8 +2375,15 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     json_mode = isinstance(rf, dict) and rf.get("type") in ("json_object", "json_schema")
     held = []
     for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
+        # ^ kind "ping": x carries the prompt's progress (total, cache, processed, time_ms) while the engine reads,
+        #   or None while this request just waits (queued again, an MCP round's engine work)
         if kind == "ping":
-            yield None
+            if req.get("return_progress") and req.get("stream") and isinstance(x, dict):
+                c = chunk({})
+                c["prompt_progress"] = x          # llama.cpp's field: the prompt read's progress, for a client's bar
+                yield c
+            else:
+                yield None
         elif kind == "mcp":
             c = chunk({})
             c["strata_mcp"] = x
@@ -2437,7 +2516,7 @@ def jobs_put(job: StreamJob) -> None:
 def openai_collect(chunks) -> dict:
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
     for c in chunks:
-        if c is None:                              # a heartbeat
+        if c is None or c.get("prompt_progress"):  # a heartbeat, a prompt-progress chunk: not answer content
             continue
         if c.get("strata_mcp"):
             mcp.append(c["strata_mcp"])
@@ -3329,7 +3408,8 @@ def main() -> int:
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
     a = ap.parse_args()
-    cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    maya_names.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engine read)
+    cfg = maya_names.env_in(json.loads(Path(a.config).read_text(encoding="utf-8-sig"))) if a.config else {}   # (a BOM: Notepad)
     apply_server_env(cfg)
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
@@ -3387,6 +3467,16 @@ def main() -> int:
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
         warn_tight_ram(engine.info.get("arena_mib"))
+        if vision is None and not vcfg and engine.info.get("vision") == "ds4":
+            # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
+            vision = ds4_vision.Vision(ds4_vision.Geometry.from_info(engine.info),
+                                       Path(tempfile.mkdtemp(prefix="maya-ds4-pictures-")), Vision.load)
+            print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}, "
+                  f"{engine.info.get('vision_mib')} MiB), up to {vision.g.max_tokens} tokens a picture", flush=True)
+        elif vision is None and not vcfg and engine.info.get("vision") == "off":
+            # (DeepSeek-V4.1: its tower did not load - the engine's NOTE line above says why; no pictures offered)
+            print("[maya] images: OFF - pictures are refused until the vision tower loads (see the line above)",
+                  flush=True)
         if on_demand:
             lent = int(engine.info.get("vision_lend") or 0)
             if lent > 0:
@@ -3402,9 +3492,19 @@ def main() -> int:
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
-    # the model's own chat template (exported with its tokenizer), else the original model's
+    # the model's own chat template (exported with its tokenizer), else the original model's.  A GLM-5.3-Flash pack's
+    # copy is the one its GGUF carried (August's): the template zai-org publishes now renders the same prompts and
+    # matches tool results to their calls without nested loops (zai-org/GLM-5.3-Flash PR #63: 100 parallel calls
+    # 137 -> 6 ms a render), so the server uses the copy shipped here (serve/glm5_chat_template.jinja) for a GLM-5
+    # pack.  MAYA_PACK_TEMPLATE=1 keeps the pack's own.
     tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    tpl = tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"
+    glm5 = ROOT / "serve/glm5_chat_template.jinja"
+    if glm5.exists() and os.environ.get("MAYA_PACK_TEMPLATE") != "1" and tpl != glm5:
+        head = tpl.read_text(encoding="utf-8", errors="replace")
+        if head.startswith("[gMASK]<sop>") and "reasoning_effort in ['low', 'high']" in head:
+            tpl = glm5
+    svc = Service(engine, tok, ChatTemplate(tpl),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)

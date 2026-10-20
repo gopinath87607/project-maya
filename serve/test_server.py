@@ -502,6 +502,19 @@ class SamplingKeys(unittest.TestCase):
             self.assertFalse([k for k in self.keys(temperature=0, strata_tune={"read_chunks": bad})
                               if k.startswith("read_chunks=")], bad)
 
+    def test_miss_skip_tune_keys(self):
+        # the GLM engine's light-miss bar and first layer for one request (STRATA_GLM_MISS_SKIP_W / _FROM)
+        k = self.keys(temperature=0, strata_tune={"miss_skip_w": 0.14, "miss_skip_from": 23})
+        self.assertIn("miss_skip_w=0.14", k)
+        self.assertIn("miss_skip_from=23", k)
+        self.assertIn("miss_skip_w=0.0", self.keys(temperature=0, strata_tune={"miss_skip_w": 0}))   # 0: off for it
+        for bad in (-0.1, 1.5, True, "0.1"):
+            self.assertFalse([x for x in self.keys(temperature=0, strata_tune={"miss_skip_w": bad})
+                              if x.startswith("miss_skip_w=")], bad)
+        for bad in (-1, 1001, True, 2.5, "23"):
+            self.assertFalse([x for x in self.keys(temperature=0, strata_tune={"miss_skip_from": bad})
+                              if x.startswith("miss_skip_from=")], bad)
+
     def test_penalty_window(self):
         self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))
         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))
@@ -776,6 +789,70 @@ class EngineDeath(unittest.TestCase):
             httpd.server_close()
 
 
+class PromptProgressStream(unittest.TestCase):
+    """`return_progress: true` on a streamed chat completion: while the prompt is read, the stream carries chunks
+    with a top-level `prompt_progress` object (llama.cpp's field, its four values), so a client can show a prefill
+    bar.  Without the flag the stream carries none; the Anthropic endpoint never sends one."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = MockEngine(self.tok, ANSWER, max_context=CTX)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+    def read(self, body):
+        httpd = serve(self.svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                text = r.read().decode()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        return [json.loads(line[len("data: "):]) for line in text.splitlines()
+                if line.startswith("data: ") and line != "data: [DONE]"]
+
+    def test_asked_for_and_sent(self):
+        class Paced(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                self.progress = (4096, 8192, 2048, 251.0)   # (read, total, reuse, ms): one chunk in
+                yield None
+                self.progress = (8192, 8192, 2048, 500.0)
+                yield None
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        self.svc.engine = Paced(self.tok, ANSWER, max_context=CTX)
+        body = {"model": "m", "stream": True, "return_progress": True, "max_tokens": 20,
+                "messages": [{"role": "user", "content": "hi"}]}
+        pps = [c["prompt_progress"] for c in self.read(body) if "prompt_progress" in c]
+        self.assertEqual(pps, [{"total": 8192, "cache": 2048, "processed": 4096, "time_ms": 251},
+                               {"total": 8192, "cache": 2048, "processed": 8192, "time_ms": 500}])
+        self.assertTrue(any(any(k in c["choices"][0]["delta"] for k in ("content", "reasoning_content"))
+                            for c in self.read(body)))
+
+    def test_not_asked_for_is_not_sent(self):
+        body = {"model": "m", "stream": True, "max_tokens": 20,
+                "messages": [{"role": "user", "content": "hi"}]}
+        self.assertFalse(any("prompt_progress" in c for c in self.read(body)))
+
+    def test_non_stream_is_untouched(self):
+        body = {"model": "m", "return_progress": True, "max_tokens": 20,
+                "messages": [{"role": "user", "content": "hi"}]}
+        httpd = serve(self.svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                out = json.loads(r.read())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertNotIn("prompt_progress", out)
+        self.assertIn("usage", out)
+
+
 class LiveRate(unittest.TestCase):
     """The Monitor's Speed readout: live.tok_s is a rate, and a request that never got a DONE keeps no counters.
 
@@ -816,7 +893,7 @@ class LiveRate(unittest.TestCase):
         engine.lines.put("DONE 1 12000 4000 10 stop 0 0 8000")
         gen = engine.generate([1], 1, {}, threading.Event())
         self.assertIsNone(next(gen))
-        self.assertEqual(engine.progress, (10000, 12000))
+        self.assertEqual(engine.progress, (10000, 12000, 0, 2000.0))
         self.assertEqual(engine.prefill_tok_s_mean, 1000.0)
         self.svc.engine = engine
         self.svc.status.update(busy=True, first_token=None)
@@ -833,6 +910,7 @@ class LiveRate(unittest.TestCase):
         gen = engine.generate([1], 1, {}, threading.Event())
         next(gen)
         self.assertIsNone(engine.prefill_tok_s_mean)
+        self.assertEqual(engine.progress, (8000, 12000, 0, 0.0))
         list(gen)
         self.svc.status["busy"] = False
         self.assertIsNone(self.metrics()["live"]["prefill_tok_s_mean"])
@@ -1330,6 +1408,13 @@ class UsageAndStatus(unittest.TestCase):
         finally:
             self.engine.multi = 0
         self.assertFalse(s["vision"]["available"])
+        self.assertIsNone(s["memory_note"])
+        old_info = getattr(self.engine, "info", None)   # (DeepSeek on a Windows APU: the page file kept experts off)
+        self.engine.info = {**(old_info or {}), "gpu_commit_capped_gb": 12, "pagefile_hint_gb": 190}
+        try:
+            self.assertIn("a page file of 190 GB", self.svc.v1_status()["memory_note"])
+        finally:
+            self.engine.info = old_info
         self.assertEqual(s["activity"]["in_flight"], 0)
         self.assertGreaterEqual(s["activity"]["requests"], 1)
         self.assertEqual(s["last_timings"]["cache_n"], ClockedEngine.REUSED)
@@ -1507,7 +1592,7 @@ class VisionFootprint(unittest.TestCase):
         d = Path(self.tmp.name)
         (d / "mmproj.gguf").write_bytes(b"x")
         self.cache = d / "vision-memory.json"
-        self.vcfg = {"exe": "strata-vision", "mmproj": str(d / "mmproj.gguf"), "model": "vocab.gguf",
+        self.vcfg = {"exe": "maya-vision", "mmproj": str(d / "mmproj.gguf"), "model": "vocab.gguf",
                      "max_tokens": 1024}
 
     def tearDown(self):

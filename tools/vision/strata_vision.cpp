@@ -4,7 +4,7 @@
 // mtmd library and the model's mmproj file (vision encoder + projector).  The engine does the rest: it places the
 // rows at the image's pad tokens and gives them their 2-D M-RoPE positions (see --serve GENI in generate.cpp).
 //
-//   strata-vision --mmproj <mmproj.gguf> --model <text model .gguf, first split> [--gpu] [--threads N]
+//   maya-vision --mmproj <mmproj.gguf> --model <text model .gguf, first split> [--gpu] [--threads N]
 //                 [--max-tokens N] [--no-flash-attn] [--no-warmup] [--measure]
 //
 // --measure: load, warm up at the largest picture, print "MEM <bytes> <base> <total>" and end - the GPU memory this
@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (mmproj.empty() || model.empty()) {
-        std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu] [--threads N] "
+        std::fprintf(stderr, "usage: maya-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu] [--threads N] "
                              "[--max-tokens N]\n");
         return 2;
     }
@@ -122,11 +122,12 @@ int main(int argc, char** argv) {
         if (gg) gguf_free(gg);
     }
     if (n_embd <= 0) { std::printf("ERR the vision encoder has no projection_dim\n"); std::fflush(stdout); return 1; }
-    // Warm up at the LARGEST picture before READY: the encoder's GPU work buffers are allocated now, not at the first
+    // Warm up GPU encoders at the LARGEST picture before READY: their work buffers are allocated now, not at the first
     // real picture.  The server starts this process before the engine, so the engine sizes its expert cache from
     // what is really left; allocating ~1 GB later, on a GPU the engine has filled, made Windows page GPU memory and
     // the engine crawl to a standstill.  (A square image well above any cap; mtmd scales it to the token limit.)
-    if (warm) {
+    // skip the expensive warmup on cpu since it does not reserve vram
+    if (warm && (gpu || measure)) {
         const uint32_t side = 2048;
         std::vector<unsigned char> rgb((size_t) side * side * 3, 128);
         mtmd_bitmap* bm = mtmd_bitmap_init(side, side, rgb.data());
