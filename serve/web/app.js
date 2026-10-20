@@ -716,7 +716,7 @@ let gpuOpen = store.get("gpu-open", null);   // the row opened (several GPUs), r
 let gpuShown = {};                           // each row's parts by its GPU, for the tooltip
 
 function gpuSegs(g, eng) {
-  const p = g.parts || {}, draft = eng.dflash ? "DFlash2" : eng.mtp ? "MTP" : "";
+  const p = g.parts || {}, draft = eng.dflash ? "DFlash2" : eng.dspark_blocks ? "DSpark" : eng.mtp ? "MTP" : "";
   return GPU_PARTS.filter((d) => (p[d.key] || 0) > 0 || d.key === "pool" || d.key === "kv")
     .map((d) => ({key: d.key, bytes: p[d.key] || 0, label: d.key === "drafter" && draft ? `Drafter (${draft})` : d.label}))
     .concat([{key: "free", label: "Free", bytes: g.free || 0}]);
@@ -1208,7 +1208,9 @@ function renderAbout(eng, hw, st, storage) {
     ["KV cache", kv],
     ["Experts", eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
                  `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}, the rest read from the SSD` : null],
-    ["Speculation", eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
+    ["Speculation", eng.dspark_blocks ? `DSpark: its ${fmt(eng.dspark_blocks)} draft block${+eng.dspark_blocks === 1 ? "" : "s"} ` +
+                       "propose the next tokens in one pass, the full model verifies them"
+                  : eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
                   : "off (one GPU, or no draft block in this model file)"],
     ["Images", eng.images ? "on" : "off"],
   ]);
