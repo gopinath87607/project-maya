@@ -129,7 +129,7 @@ class Updater:
         return {"current": self.current, "enabled": self.enabled(), "latest": self.latest, "newer": newer,
                 "checked": self.checked or None, "error": self.error, "can_update": newer and why is None,
                 "blocker": why, "state": state,
-                "by_hand": ("git pull, then start Maya again (./setup.sh or START-MAYA.bat)" if (self.root / ".git").exists()
+                "by_hand": ("git pull, then start Strata-DeepSeek again (./setup.sh or START-MAYA.bat)" if (self.root / ".git").exists()
                             else "download the new release from GitHub into a new folder")}
 
     def busy(self) -> bool:

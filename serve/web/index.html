@@ -1,20 +1,20 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#090a14">
-<title>Project Maya</title>
+<meta name="theme-color" content="#f7f1e6">
+<title>Strata-DeepSeek</title>
 <link rel="manifest" href="web/manifest.webmanifest">
 <link rel="icon" href="web/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="web/tokens.css">
 <link rel="stylesheet" href="web/components.css">
 <link rel="stylesheet" href="web/app.css">
 <script>
-  // the theme before the first paint: the saved choice, else dark (Maya's default).  "maya.ui-theme": a choice
-  // saved under the paper skin ("maya.theme") does not carry over
+  // the theme before the first paint: the saved choice, else sandal white (the default).  "strata.ui-theme": a choice
+  // saved under Maya's old skin does not carry over
   try {
-    const t = localStorage.getItem("maya.ui-theme") || "dark";
+    const t = localStorage.getItem("strata.ui-theme") || "light";
     document.documentElement.dataset.theme = t;
   } catch (e) {}
 </script>
@@ -34,7 +34,7 @@
       <svg viewBox="0 0 24 24" fill="none"><path d="M9 4.5h6v3H9z" fill="currentColor" opacity=".95"/>
         <path d="M6.5 9h11v3.5h-11z" fill="currentColor" opacity=".8"/><path d="M4 14h16v4.5H4z" fill="currentColor" opacity=".65"/></svg>
     </span>
-    <span class="brand__text"><span class="brand__name">Maya</span><span class="brand__sub">local AI</span></span>
+    <span class="brand__text"><span class="brand__name">Strata-DeepSeek</span><span class="brand__sub">DeepSeek V4.1</span></span>
   </div>
   <button class="st-btn st-btn--icon chats-toggle" id="chats-toggle" title="Chats" aria-label="Chats" aria-controls="chats" aria-expanded="false">
     <svg class="st-icon"><use href="web/sprite.svg#i-menu"/></svg></button>
@@ -100,7 +100,7 @@
           <button type="button" class="st-btn st-btn--secondary st-btn--sm" id="edit-cancel">Cancel</button>
         </div>
         <div class="attachments" id="attachments" hidden></div>
-        <textarea id="input" rows="2" placeholder="Message Maya&hellip;" aria-label="Message"></textarea>
+        <textarea id="input" rows="2" placeholder="Message DeepSeek&hellip;" aria-label="Message"></textarea>
         <div class="st-composer__bar">
           <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file">
             <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
@@ -134,6 +134,26 @@
       </div>
       <div class="banners" id="banners"></div>
 
+      <!-- the Monitor's own tabs: each appears only when the engine reports what it shows (app.js renderMonitorTabs) -
+           two GPUs or ten, a drafter or none, a page of tabs the engine's own facts fill, never empty ones -->
+      <div class="st-tabs mtabbar" id="monitor-tabs" role="tablist" aria-label="Monitor views">
+        <button class="st-tab" role="tab" data-mtab="overview" aria-selected="true">
+          <svg class="st-icon"><use href="web/sprite.svg#i-activity"/></svg><span>Overview</span></button>
+        <button class="st-tab" role="tab" data-mtab="gpus" aria-selected="false" hidden>
+          <svg class="st-icon"><use href="web/sprite.svg#i-gpu"/></svg><span>GPUs</span><span class="mtab__v" id="mtab-v-gpus"></span></button>
+        <button class="st-tab" role="tab" data-mtab="lend" aria-selected="false" hidden>
+          <svg class="st-icon"><use href="web/sprite.svg#i-experts"/></svg><span>Loan</span><span class="mtab__v" id="mtab-v-lend"></span></button>
+        <button class="st-tab" role="tab" data-mtab="prefill" aria-selected="false" hidden>
+          <svg class="st-icon"><use href="web/sprite.svg#i-bolt"/></svg><span>Prefill</span><span class="mtab__v" id="mtab-v-prefill"></span></button>
+        <button class="st-tab" role="tab" data-mtab="storage" aria-selected="false" hidden>
+          <svg class="st-icon"><use href="web/sprite.svg#i-disk"/></svg><span>Storage</span><span class="mtab__v" id="mtab-v-storage"></span></button>
+        <button class="st-tab" role="tab" data-mtab="engram" aria-selected="false" hidden>
+          <svg class="st-icon"><use href="web/sprite.svg#i-layers"/></svg><span>Engram</span><span class="mtab__v" id="mtab-v-engram"></span></button>
+        <button class="st-tab" role="tab" data-mtab="draft" aria-selected="false" hidden>
+          <svg class="st-icon"><use href="web/sprite.svg#i-thinking"/></svg><span>Draft</span><span class="mtab__v" id="mtab-v-draft"></span></button>
+      </div>
+
+      <div class="mpanel" id="mpanel-overview" role="tabpanel" aria-label="Overview">
       <!-- hero: what the model is doing right now -->
       <div class="st-card hero">
         <div class="hero__top">
@@ -195,21 +215,6 @@
         <p class="tier-advice muted small" id="tier-advice" hidden></p>
       </div>
 
-      <!-- the GPUs: what fills each (the GLM engine's VRAM lines and NVML's processes) and, with several, each one's load,
-           power, temperature and PCIe link.  A row a GPU, the parts' colours once above them, a row's own parts when
-           opened; an engine without VRAM lines: NVML's memory only, from five GPUs (app.js renderGpuMap) -->
-      <div class="st-card gpumap-card" id="gpumap-card" hidden>
-        <div class="card-head">
-          <span class="card-title" id="gpumap-title">What fills the GPU</span>
-          <span class="muted small" id="gpumap-sub"></span>
-        </div>
-        <div class="gpukey" id="gpukey" hidden></div>
-        <div class="gpurows" id="gpurows"></div>
-        <p class="gpumap-now muted small" id="gpumap-now" hidden></p>
-        <p class="tier-advice muted small" id="gpumap-advice" hidden></p>
-        <div class="gpubar-tip" id="gpubar-tip" role="tooltip" hidden></div>
-      </div>
-
       <div class="section-title">Hardware</div>
       <div class="metrics" id="metrics">
         <!-- filled by app.js: the GPU row (active, VRAM, power, temperature), the host row (PCIe, CPU, RAM, disk) -->
@@ -245,6 +250,100 @@
         <div class="mcp-list" id="mcp-list"></div>
         <p class="muted small mcp-note">Their tools run on this machine with your rights, when the model decides to call them
           (in this page's chat only; switch it off in Settings).</p>
+      </div>
+      </div>
+
+      <!-- the split, card by card: the engine's own LEND lines (app.js renderGpuPanel) -->
+      <div class="mpanel" id="mpanel-gpus" role="tabpanel" aria-label="GPUs" hidden>
+        <div class="st-card gpus-card" id="gpus-card" hidden>
+          <div class="card-head">
+            <span class="card-title">The split, card by card</span>
+            <span class="muted small" id="gpus-sub"></span>
+          </div>
+          <div class="gpus-list" id="gpus-list"></div>
+          <p class="muted small gpus-note">Each card as the engine reports it: the layers on it, the experts it holds for
+            good, the drafter's and the trunk's slots its prompt arena lends between prompts, and the chunk its prompt
+            path takes. The page sums whatever the engine reports.</p>
+        </div>
+
+        <!-- the GPUs: what fills each (the GLM engine's VRAM lines and NVML's processes) and, with several, each one's load,
+             power, temperature and PCIe link.  A row a GPU, the parts' colours once above them, a row's own parts when
+             opened; an engine without VRAM lines: NVML's memory only, from five GPUs (app.js renderGpuMap) -->
+        <div class="st-card gpumap-card" id="gpumap-card" hidden>
+          <div class="card-head">
+            <span class="card-title" id="gpumap-title">What fills the GPU</span>
+            <span class="muted small" id="gpumap-sub"></span>
+          </div>
+          <div class="gpukey" id="gpukey" hidden></div>
+          <div class="gpurows" id="gpurows"></div>
+          <p class="gpumap-now muted small" id="gpumap-now" hidden></p>
+          <p class="tier-advice muted small" id="gpumap-advice" hidden></p>
+          <div class="gpubar-tip" id="gpubar-tip" role="tooltip" hidden></div>
+        </div>
+      </div>
+
+      <!-- lending and borrowing: the arena's experts between prompts, the prompt's buffers during one (renderLendPanel) -->
+      <div class="mpanel" id="mpanel-lend" role="tabpanel" aria-label="Loan" hidden>
+        <div class="st-card lend-card" id="lend-card" hidden>
+          <div class="card-head">
+            <span class="card-title">Lending and borrowing</span>
+            <span class="muted small" id="lend-sub"></span>
+          </div>
+          <div class="metrics metrics--tiers metrics--four" id="lend-metrics"></div>
+          <div class="lend-rows" id="lend-rows"></div>
+          <p class="muted small lend-note">While the model reads a prompt its expert banks are lent back to the prompt:
+            the same bytes are the chunk buffers, then experts again. The engine's own report, summed over whatever
+            cards it found.</p>
+        </div>
+      </div>
+
+      <!-- reading a prompt: the engine's chunk per card, its path and the rate (renderPrefillPanel) -->
+      <div class="mpanel" id="mpanel-prefill" role="tabpanel" aria-label="Prefill" hidden>
+        <div class="st-card prefill-card" id="prefill-card" hidden>
+          <div class="card-head">
+            <span class="card-title">Reading a prompt</span>
+            <span class="muted small" id="prefill-sub"></span>
+          </div>
+          <div class="metrics metrics--tiers metrics--four" id="prefill-metrics"></div>
+          <div class="table-wrap" id="prefill-chunks"></div>
+          <p class="muted small prefill-note" id="prefill-note"></p>
+        </div>
+      </div>
+
+      <!-- the model on the disk: its folder, the free space, the SSD reads a token costs (renderStoragePanel) -->
+      <div class="mpanel" id="mpanel-storage" role="tabpanel" aria-label="Storage" hidden>
+        <div class="st-card storage-card" id="storage-card" hidden>
+          <div class="card-head">
+            <span class="card-title">The model on the disk</span>
+            <span class="muted small" id="storage-sub"></span>
+          </div>
+          <div class="metrics metrics--tiers metrics--four" id="storage-metrics"></div>
+          <p class="muted small storage-note" id="storage-note"></p>
+        </div>
+      </div>
+
+      <!-- the n-gram memory (Engram): its layers, lookups and read time (renderEngramPanel) -->
+      <div class="mpanel" id="mpanel-engram" role="tabpanel" aria-label="Engram" hidden>
+        <div class="st-card engram-card" id="engram-card" hidden>
+          <div class="card-head">
+            <span class="card-title">The n-gram memory (Engram)</span>
+            <span class="muted small" id="engram-sub"></span>
+          </div>
+          <div class="metrics metrics--tiers metrics--four" id="engram-metrics"></div>
+          <p class="muted small engram-note" id="engram-note"></p>
+        </div>
+      </div>
+
+      <!-- speculative decoding (DSpark): its block, acceptance and time a token (renderDraftPanel) -->
+      <div class="mpanel" id="mpanel-draft" role="tabpanel" aria-label="Draft" hidden>
+        <div class="st-card draft-card" id="draft-card" hidden>
+          <div class="card-head">
+            <span class="card-title">Speculative decoding (DSpark)</span>
+            <span class="muted small" id="draft-sub"></span>
+          </div>
+          <div class="metrics metrics--tiers metrics--four" id="draft-metrics"></div>
+          <p class="muted small draft-note" id="draft-note"></p>
+        </div>
       </div>
     </div>
   </section>

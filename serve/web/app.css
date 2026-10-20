@@ -1,4 +1,4 @@
-/* Project Maya web app - layout on top of tokens.css + components.css. Colours, type, radii and shadows come only
+/* Strata-DeepSeek web app - layout on top of tokens.css + components.css. Colours, type, radii and shadows come only
    from the tokens. */
 [hidden] { display: none !important; }
 html, body { height: 100%; }
@@ -20,7 +20,7 @@ main { min-height: 0; min-width: 0; display: flex; }
         backdrop-filter: blur(12px); min-height: 0; }
 .brand { display: flex; align-items: center; gap: var(--st-s-3); padding: 0 var(--st-s-1); }
 .brand__text { display: flex; flex-direction: column; line-height: 1.1; }
-.brand__name { font-weight: var(--st-fw-black); font-size: 20px; letter-spacing: -.02em; }
+.brand__name { font-weight: var(--st-fw-black); font-size: 17px; letter-spacing: -.02em; white-space: nowrap; }
 .brand__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); letter-spacing: .04em; }
 .side__spacer { flex: 1; }
 .side__model { font-size: var(--st-fs-xs); color: var(--st-ink-muted); padding: 0 var(--st-s-2); overflow-wrap: anywhere; }
@@ -266,7 +266,7 @@ button.gpurow__line:focus-visible { outline: 2px solid var(--st-accent); outline
        border: 1px solid var(--st-line); border-radius: var(--st-r-md); }
 .seg button { height: 32px; border: 0; border-radius: 9px; background: transparent; color: var(--st-ink-muted);
               font: 500 var(--st-fs-sm)/1 var(--st-font); cursor: pointer; }
-.seg button[aria-checked="true"] { background: var(--st-accent); color: #fff; font-weight: 650; }
+.seg button[aria-checked="true"] { background: var(--st-accent); color: var(--st-accent-ink); font-weight: 650; }
 .drawer-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--st-s-3); margin-top: var(--st-s-2); }
 .st-toast { animation: toast-in 180ms var(--st-ease); }
 @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } }
@@ -509,3 +509,57 @@ body:not([data-tab="chat"]) .chats__search, body:not([data-tab="chat"]) .chats__
 .tab-dot { flex: none; width: 8px; height: 8px; margin-left: auto; border-radius: 50%; background: var(--st-accent);
            box-shadow: 0 0 0 3px var(--st-accent-tint); }
 .tab-dot[hidden] { display: none; }
+
+/* ---------------------------------------------------------------- monitor: its own tabs */
+/* a row of tab buttons above the panels (the sidebar's .st-tabs is a column; this one wraps) */
+.mtabbar { flex-direction: row; flex-wrap: wrap; gap: var(--st-s-2); padding: 4px; align-self: flex-start;
+           background: var(--st-surface-2); border: 1px solid var(--st-line); border-radius: var(--st-r-lg); }
+.mtabbar[hidden] { display: none; }
+.mtabbar .st-tab { height: 34px; padding: 0 12px; gap: 8px; font-size: var(--st-fs-sm); border-radius: var(--st-r-md); }
+.mtabbar .st-tab[aria-selected="true"] { background: var(--st-surface); box-shadow: var(--st-sh-card); }
+.mtabbar .st-tab[hidden] { display: none; }
+.mpanel { display: flex; flex-direction: column; gap: var(--st-s-5); }
+.mpanel[hidden] { display: none; }
+
+/* ---------------------------------------------------------------- monitor: the split, card by card */
+.gpus-card, .lend-card, .prefill-card, .storage-card, .engram-card, .draft-card { display: flex; flex-direction: column; gap: var(--st-s-4); }
+.gpus-list, .lend-rows { display: flex; flex-direction: column; gap: var(--st-s-3); }
+.gpu-line, .lend-row { display: grid; grid-template-columns: 190px minmax(0, 1fr) 150px; align-items: center;
+                       column-gap: var(--st-s-4); row-gap: 4px; }
+.gpu-line__name, .lend-row__name { display: flex; flex-direction: column; min-width: 0; line-height: 1.3; }
+.gpu-line__name b, .lend-row__name b { font-size: var(--st-fs-sm); font-weight: 650; }
+.gpu-line__name span, .lend-row__name span { font-size: var(--st-fs-xs); color: var(--st-ink-muted); white-space: nowrap;
+                                             overflow: hidden; text-overflow: ellipsis; }
+.gpu-line__nums, .lend-row__nums { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; min-width: 0;
+                                   font-size: var(--st-fs-xs); color: var(--st-ink-muted); font-variant-numeric: tabular-nums;
+                                   white-space: nowrap; }
+.gpu-line__nums b, .lend-row__nums b { font-size: var(--st-fs-sm); font-weight: 650; color: var(--st-ink); }
+.gpus-note, .lend-note, .prefill-note, .storage-note, .engram-note, .draft-note { margin: 0; line-height: 1.45; }
+
+/* a card's bar: a part a hue (the same hues the GPU map's bars use), the widths the bytes; free stays the bare track */
+.mibbar { display: flex; height: 18px; gap: 2px; border-radius: 6px; overflow: hidden; background: var(--st-surface-3);
+          --mb-weights: #2a78d6; --mb-pool: var(--st-accent); --mb-lend: #1baf7a; --mb-mtp: #e87ba4;
+          --mb-prompt: #eda100; --mb-spare: color-mix(in srgb, var(--st-ink-muted) 30%, var(--st-surface-3));
+          --mb-free: transparent; }
+[data-theme="dark"] .mibbar { --mb-weights: #3987e5; --mb-lend: #199e70; --mb-mtp: #d55181; --mb-prompt: #c98500; }
+.mibbar__seg { display: block; height: 100%; min-width: 2px; flex: 0 1 0; border-radius: 3px;
+               background: var(--mb-free); transition: flex-grow 400ms var(--st-ease); }
+.mibbar__seg[data-k="weights"] { background: var(--mb-weights); }
+.mibbar__seg[data-k="pool"] { background: var(--mb-pool); }
+.mibbar__seg[data-k="lend"] { background: var(--mb-lend); }
+.mibbar__seg[data-k="mtp"] { background: var(--mb-mtp); }
+.mibbar__seg[data-k="prompt"] { background: var(--mb-prompt); }
+.mibbar__seg[data-k="spare"] { background: var(--mb-spare); }
+.mibbar__seg[data-k="free"] { background: transparent; min-width: 0; }
+
+@media (max-width: 760px) {
+  .gpu-line, .lend-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .gpu-line .mibbar, .lend-row .mibbar { grid-column: 1 / -1; }
+  .lend-rows, .gpus-list { gap: var(--st-s-4); }
+}
+
+/* the live number each view carries in its tab (the engine's own facts, summed) */
+.mtab__v { font-size: 11px; font-weight: 650; font-variant-numeric: tabular-nums; color: var(--st-ink-muted);
+           background: var(--st-surface-3); border-radius: var(--st-r-pill); padding: 2px 7px; margin-left: 2px; }
+.mtab__v:empty { display: none; }
+.mtabbar .st-tab[aria-selected="true"] .mtab__v { background: var(--st-accent-tint); color: var(--st-accent-text); }

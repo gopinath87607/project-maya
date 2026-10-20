@@ -1,4 +1,4 @@
-/* Project Maya UI - components. Requires tokens.css. */
+/* Strata-DeepSeek UI - components. Requires tokens.css. */
 *,*::before,*::after{box-sizing:border-box}
 html,body{margin:0;color:var(--st-ink);font-family:var(--st-font);font-size:var(--st-fs-base);line-height:var(--st-lh-body);-webkit-font-smoothing:antialiased}
 body{background:
@@ -16,7 +16,7 @@ a{color:var(--st-accent-text);text-decoration:none} a:hover{text-decoration:unde
 /* the brand mark: a stepped pyramid in the brand gradient */
 .maya-mark{width:36px;height:36px;flex:none;border-radius:11px;display:grid;place-items:center;
   background:linear-gradient(135deg,var(--st-accent),var(--st-accent-2));box-shadow:var(--st-glow)}
-.maya-mark svg{width:22px;height:22px;color:#fff}
+.maya-mark svg{width:22px;height:22px;color:var(--st-accent-ink)}
 
 /* status pill */
 .st-pill{display:inline-flex;align-items:center;gap:8px;min-height:32px;padding:0 12px;border-radius:var(--st-r-pill);border:1px solid var(--st-line);background:var(--st-surface-2);font-size:var(--st-fs-sm);font-weight:500;color:var(--st-ink-soft);font-variant-numeric:tabular-nums}
@@ -71,7 +71,7 @@ a{color:var(--st-accent-text);text-decoration:none} a:hover{text-decoration:unde
 .st-msg{display:flex;flex-direction:column;gap:6px;max-width:760px}
 .st-msg--user{align-self:flex-end;align-items:flex-end}
 .st-bubble{padding:12px 16px;border-radius:var(--st-r-lg);font-size:var(--st-fs-base);line-height:1.6;color:var(--st-ink-soft)}
-.st-msg--user .st-bubble{background:linear-gradient(135deg,var(--st-accent),color-mix(in srgb,var(--st-accent) 70%,var(--st-accent-2)));color:#fff;border-bottom-right-radius:6px;box-shadow:var(--st-glow)}
+.st-msg--user .st-bubble{background:linear-gradient(135deg,var(--st-accent),color-mix(in srgb,var(--st-accent) 70%,var(--st-accent-2)));color:var(--st-accent-ink);border-bottom-right-radius:6px;box-shadow:var(--st-glow)}
 .st-msg--assistant .st-bubble{background:transparent;padding-left:2px;padding-right:2px}
 .st-msg__meta{font-size:var(--st-fs-xs);color:var(--st-ink-muted);display:flex;gap:8px;align-items:center}
 
@@ -105,7 +105,7 @@ a{color:var(--st-accent-text);text-decoration:none} a:hover{text-decoration:unde
 /* buttons */
 .st-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:40px;padding:0 18px;border-radius:var(--st-r-md);border:0;font:650 var(--st-fs-md)/1 var(--st-font);cursor:pointer;transition:background var(--st-dur),transform 120ms,box-shadow var(--st-dur)}
 .st-btn:active{transform:translateY(1px)}
-.st-btn--primary{background:linear-gradient(135deg,var(--st-accent),color-mix(in srgb,var(--st-accent) 75%,var(--st-accent-2)));color:#fff;box-shadow:var(--st-glow)}
+.st-btn--primary{background:linear-gradient(135deg,var(--st-accent),color-mix(in srgb,var(--st-accent) 75%,var(--st-accent-2)));color:var(--st-accent-ink);box-shadow:var(--st-glow)}
 .st-btn--primary:hover{filter:brightness(1.08)}
 .st-btn--secondary{background:transparent;color:var(--st-ink);border:1px solid var(--st-line)}
 .st-btn--secondary:hover{background:var(--st-surface-2)}

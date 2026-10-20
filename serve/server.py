@@ -433,6 +433,7 @@ class StrataEngine:
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.vram = []                   # VRAM lines: what each part holds on its GPU (the Monitor's GPU map)
+        self.lend = {}                   # LEND lines by device: each GPU's experts, its prompt arena, its chunk
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total, reuse, ms) prompt progress while a prompt is read, from PP lines
         try:                             # a ready-made engine's BUILD.json says its version
@@ -450,6 +451,8 @@ class StrataEngine:
                 part = gpu_map.parse(line)
                 if part:
                     self.vram.append(part)
+            if line.startswith("LEND "):
+                self._parse_lend(line)
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -515,6 +518,9 @@ class StrataEngine:
 
     def _pump(self):
         for line in self.proc.stdout:
+            if line.startswith("LEND "):   # the engine's GPUs as it found them (a line a card, whatever the count)
+                self._parse_lend(line)
+                continue
             if self.multi and self._route(line):
                 continue
             self.lines.put(line)
@@ -655,6 +661,26 @@ class StrataEngine:
         if hist is None:
             hist = self.stat_history = collections.deque(maxlen=120)
         hist.append(st)
+
+    def _parse_lend(self, line):
+        """LEND dev=... (one line a GPU, at the start and whenever the layout changes): that card's part of the split -
+        its layers, the experts it holds for good, the drafter's and the trunk's slots its prompt arena lends it, the
+        arena, and the chunk its prompt path takes.  The keys are the engine's; the Monitor sums what it finds, so a
+        two-GPU and a ten-GPU machine read the same."""
+        row = {}
+        for kv in line.split()[1:]:
+            k, _, v = kv.partition("=")
+            if k == "pci":
+                row[k] = gpu_map.pci_key(v) or v
+                continue
+            if k == "layers":
+                a, _, b = v.partition("-")
+                if a.lstrip("-").isdigit() and b.isdigit():
+                    row[k] = [int(a), int(b)]
+                continue
+            row[k] = int(v) if v.lstrip("-").isdigit() else v
+        if "dev" in row:
+            self.lend[row["dev"]] = row
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -1521,7 +1547,7 @@ class Service:
         hw, st = tel.get("now") or {}, tel.get("static") or {}
         gib = lambda b: f"{b / 2**30:.1f} GB" if isinstance(b, (int, float)) else "?"  # noqa: E731
         import platform
-        out = [f"Project Maya {MAYA_VERSION or '?'} - report of {time.strftime('%Y-%m-%d %H:%M')}",
+        out = [f"Strata-DeepSeek {MAYA_VERSION or '?'} - report of {time.strftime('%Y-%m-%d %H:%M')}",
                f"System: {platform.platform()}, Python {platform.python_version()}",
                f"GPU: {st.get('gpu_name') or 'not readable'} ({gib(hw.get('gpu_mem_total'))} VRAM)",
                f"CPU: {st.get('cpu_name') or '?'}, {st.get('threads') or '?'} threads; RAM {gib(hw.get('ram_total'))}",
@@ -1630,17 +1656,25 @@ class Service:
         with self.status_lock:
             reload = dict(self.reload) if self.reload else None
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
-        # the GLM engine's expert tiers (STAT lines): the latest reading and the recent series for the sparklines
+        # the engine's expert tiers (STAT lines): the latest reading and the recent series for the sparklines - every
+        # numeric key it reported, found in the history itself (no list kept here: an engine's own keys make their cards)
         tiers = None
         stat = getattr(self.engine, "stat", None)
         if stat:
             sh = list(getattr(self.engine, "stat_history", []) or [])
-            tiers = {"now": stat, "history": {k: [s.get(k) for s in sh] for k in
-                                              ("tok_s", "ms_tok", "vram_hit", "ram_fetch", "disk", "promo",
-                                               "cpu", "ram", "disk_mb", "engram_ms")}}   # (the last four: DeepSeek's)
+            keys = set()
+            for row in sh:
+                keys.update(k for k, v in row.items()
+                            if k != "time" and isinstance(v, (int, float)) and not isinstance(v, bool))
+            tiers = {"now": stat, "history": {k: [row.get(k) for row in sh] for k in sorted(keys)}}
+        # each GPU as the engine reported it (LEND lines: a card a line, whatever the machine has)
+        lend = None
+        reported = getattr(self.engine, "lend", None)
+        if reported:
+            lend = [reported[k] for k in sorted(reported)]
         hw = dict(tel["now"])
         cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
-        return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": self._gpu_map(cards),
+        return {"engine": engine, "live": live, "tiers": tiers, "lend": lend, "gpu_map": self._gpu_map(cards),
                 "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "hardware": hw,
                 "hardware_static":
@@ -1659,7 +1693,8 @@ class Service:
         return gpu_map.view(report, cards, proc.pid if proc is not None else None,
                             vproc.pid if vproc is not None else None, lent)
 
-    # the GLM engine's live STAT values (StrataEngine._parse_stat) exported as gauges: key -> help
+    # the engine's live STAT values (StrataEngine._parse_stat) exported as gauges: these have a written help; any other
+    # numeric key the engine reports is exported too, under a generic help (the list here is not a filter)
     PROM_STAT = {"tok_s": "Decode rate over the running request, tokens/s",
                  "vram_hit": "Share of the routed experts found in VRAM (0..1)",
                  "ram_fetch": "Experts a token read from the RAM tier",
@@ -1668,6 +1703,16 @@ class Service:
                  "cpu": "Experts a token computed on the CPU lane (DeepSeek)",
                  "disk_mb": "MB a token the storage read (DeepSeek, Linux)",
                  "engram_ms": "The n-gram memory's (Engram) read time a token, ms (DeepSeek)",
+                 "eg_rows": "The n-gram memory's (Engram) rows a token (DeepSeek)",
+                 "eg_hit": "The share of Engram rows its cache served (DeepSeek)",
+                 "phase": "The expert layout in use: 0 the prompt's, 1 the decoder's (DeepSeek lending)",
+                 "lend_n": "Experts the last refill lent into VRAM (DeepSeek)",
+                 "lend_gb": "GB the last refill lent into VRAM (DeepSeek)",
+                 "lend_ms": "The last refill's time, ms (DeepSeek)",
+                 "drafts": "The share of the drafts the full model kept (DeepSeek DSpark)",
+                 "draft_n": "Drafts the drafter offered a token (DeepSeek DSpark)",
+                 "draft_ms": "The drafter's time a token, ms (DeepSeek DSpark)",
+                 "verify_ms": "The drafts' verification time a token, ms (DeepSeek DSpark)",
                  "vram_used": "Expert slots in use in VRAM", "vram_slots": "Expert slots in VRAM",
                  "ram_used": "Expert slots in use in RAM", "ram_slots": "Expert slots in RAM"}
 
@@ -1697,8 +1742,12 @@ class Service:
             ("maya:engine_alive", "gauge", "1 while the engine process runs",
              int(self.engine.alive()) if hasattr(self.engine, "alive") else 1),
         ]
-        rows += [(f"maya:engine_{k}", "gauge", h, stat[k]) for k, h in self.PROM_STAT.items()
-                 if isinstance(stat.get(k), (int, float)) and not isinstance(stat.get(k), bool)]
+        # every numeric value the engine's STAT line reports (not a fixed list: a new engine key is exported by itself)
+        for k, v in sorted(stat.items()):
+            if k == "time" or not isinstance(v, (int, float)) or isinstance(v, bool):
+                continue
+            rows.append((f"maya:engine_{k}", "gauge",
+                         self.PROM_STAT.get(k, f"The engine's {k}, from its STAT line"), v))
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
 
@@ -2953,7 +3002,7 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages") and (svc.reloading() or svc.updater.busy()):
                     # a context change is reloading the model, or Maya is updating: say so, and when to try again
-                    why = ("Project Maya is updating and starts again in a few minutes" if svc.updater.busy() else
+                    why = ("Strata-DeepSeek is updating and starts again in a few minutes" if svc.updater.busy() else
                            "the model is reloading with a new context size; try again in a minute")
                     body = json.dumps({"error": {"type": "overloaded_error", "message": why}}).encode()
                     self.send_response(503)
@@ -3532,6 +3581,11 @@ def main() -> int:
         print("[maya] browser pages allowed to call /v1/* (CORS): " + ", ".join(svc.cors_origins), flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
+    if not svc.gpu_indices:                             # the config names none: the engine's own LEND lines say which
+        pcis = {gpu_map.pci_key(v.get("pci")) for v in (getattr(engine, "lend", {}) or {}).values()} - {None}
+        if pcis:
+            from serve.telemetry import indices_for_pci
+            svc.gpu_indices = indices_for_pci(pcis)     # cards it found (matched by PCI, whatever their count)
     if a.config:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
     args = [str(x) for x in cfg.get("args") or []]
@@ -3539,6 +3593,8 @@ def main() -> int:
         svc.model_dir = Path(args[args.index("--glm-pack") + 1]).resolve().parent
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
                          daemon=True).start()
+    if "--pack" in args[:-1]:                           # (DeepSeek's pack: its parent is the model's folder, for the
+        svc.model_dir = Path(args[args.index("--pack") + 1]).resolve().parent   # Monitor's Storage view)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:

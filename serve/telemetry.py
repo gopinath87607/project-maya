@@ -43,6 +43,27 @@ def gpu_pids():
     return out
 
 
+def indices_for_pci(pcis) -> list:
+    """The NVML numbers of the cards at these PCI addresses ("0000:83:00"): an engine that names its cards by PCI (the
+    LEND lines) tells the Monitor which cards to read, whatever the count and whatever order it runs them in."""
+    first = _Nvml(0)
+    if not first.ok():
+        return []
+    count = ctypes.c_uint()
+    try:
+        fn = getattr(first.lib, "nvmlDeviceGetCount_v2", None) or first.lib.nvmlDeviceGetCount
+        if fn(ctypes.byref(count)) != 0:
+            return []
+    except (AttributeError, OSError):
+        return []
+    out = []
+    for i in range(count.value):
+        c = first if i == 0 else _Nvml(i)
+        if c.ok() and c.pci() in pcis:
+            out.append(i)
+    return out
+
+
 class _Nvml:
     class Util(ctypes.Structure):
         _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
@@ -296,12 +317,12 @@ class Telemetry:
                 g["util"] = sum(u) / len(u) if u else None
                 t = vals("temp")
                 g["temp"] = max(t) if t else None
-                s["gpus"] = [{"index": i, "util": r.get("util"), "mem_used": r.get("mem_used"),
+                s["gpus"] = [{"index": i, "pci": pci, "name": name, "util": r.get("util"), "mem_used": r.get("mem_used"),
                               "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power"),
                               "power_limit": r.get("power_limit"), "pcie_gen": r.get("pcie_gen"),
                               "pcie_gen_max": r.get("pcie_gen_max"), "pcie_width": r.get("pcie_width"),
                               "pcie_rx_mb": r.get("pcie_rx_mb")}
-                             for i, r in reads]
+                             for (i, pci, name), (_, r) in zip(self.cards, reads)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
             # each card's memory and the processes holding it, for the Monitor's map of a GPU (serve/gpu_map.py)
             s["vram"] = [{"index": i, "pci": pci, "name": name, "used": r.get("mem_used"), "total": r.get("mem_total"),
