@@ -134,6 +134,8 @@ public:
     int feed_unit() const;
     /// Called from feed() while a run of chunks goes through the layers, with the tokens done so far.
     void set_progress(std::function<void(int64_t)> f);
+    /// The server mode: emit LIVE lines (per device: the stage, the layer, the chunk, the loan) on stdout.
+    void set_live(bool on);
     int64_t pos() const;
     int64_t max_context() const;
     int vocab() const;

@@ -1868,6 +1868,7 @@ struct Model::Impl {
             }
             CK(cudaMemGetInfo(&d.free0, &d.total));
         }
+        live_dev = std::make_unique<LiveDev[]>(devs.size());
         // the VRAM each GPU leaves free: --reserve-mib (every GPU) wins, else --reserve-pct (one entry per GPU in the
         // split's order, a single entry for all, a short list repeating its last one; never under 64 MiB), else the
         // 600 MiB default.  Resolved once here: the load's decisions and place_experts all read it per device.
@@ -6466,10 +6467,14 @@ struct Model::Impl {
                 fc.pdst = sr.ckv[(size_t) l.dev] + (size_t) g_first * ckv_rb();
                 fc.pdst_stride = (long long) ckv_rb();
                 finish(const_cast<float*>(latent), ng, HD, HD, fc, s);
-                if (mi == 0 && sr.remote) {   // the new rows for the other groups' readers (slot k % 2, once
-                    const int slot = wp.k % 2;  // they took the chunk before last's)
+                if (mi == 0 && sr.remote && !(tail_mode && l.il == g.cand_src)) {   // the new rows for the other groups'
+                    // readers (slot k % 2, once they took the chunk before last's).  The candidate source's readers run
+                    // in the second pass only: their rows are copied to them between the passes, so no put or ack here
+                    const int slot = wp.k % 2;
                     if (wp.k >= 2)
-                        for (int r : sr.readers) wait_flags(sr.x_ack + ((size_t) slot * devs.size() + r) * 32, 1, 32, wp.win - 2, s);
+                        for (int r : sr.readers)
+                            if (!tail_mode || (size_t) r >= pass_devs.size() || pass_devs[(size_t) r])
+                                wait_flags(sr.x_ack + ((size_t) slot * devs.size() + r) * 32, 1, 32, wp.win - 2, s);
                     Xfer x;
                     x.src[0] = fc.pdst;
                     x.dst[0] = sr.stage(slot);
@@ -6665,7 +6670,149 @@ struct Model::Impl {
         std::vector<int> T;
         std::vector<unsigned> seq;
         int64_t snap_pos = -1;   // feed_mark: the position whose state before it the layers keep (-1: none)
+        int stage = 0;           // 0: the encoder pass (every token); 1: the decoder-tail pass (the last rows only)
     };
+    // ---- the decoder tail (DS4_TAIL_PREFILL): layers after the candidate source layer only attend over the last rows
+    // they can see - layer L's rows before (nl - 1 - L) * win are not reachable from the last win rows - so a prompt
+    // runs them over the last tail_rows() rows only, seeded with the candidate source's h | pre | topk | cand
+    bool tail_mode = false;      // (workers: this feed runs the two passes; no source puts to idle readers)
+    std::vector<char> pass_devs; // (this pass: the devices with a layer in it - the source puts wait only on them)
+    int chunk_prog_dev = -1;     // (the device whose chunks the progress reports follow; -1: none)
+    uint8_t* tail_host = nullptr;   // pinned: the tail's h | pre | topk | cand after the candidate source layer
+    size_t tail_host_b = 0;
+    uint8_t* src_host = nullptr;    // pinned: a source's rows between the passes
+    size_t src_host_b = 0;
+    int tail_first() const { return g.cand_src >= 0 ? g.cand_src + 1 : -1; }
+    int tail_rows() const { return g.cand_src >= 0 ? g.win + (g.nl - 1 - g.cand_src) * g.win : 0; }
+    bool tail_feed(const std::vector<Run>& runs, int n, int logits_rows) const {
+        static const char* en = std::getenv("DS4_TAIL_PREFILL");
+        if (en == nullptr || std::atoi(en) == 0) return false;
+        if (g.cand_src < 0 || tail_first() >= g.nl || devs.size() < 2 || logits_rows > kWin) return false;
+        if (n <= tail_rows()) return false;
+        const int gi = L[(size_t) g.cand_src].grp;
+        if (gi >= (int) chunk_steps.size() || chunk_steps[(size_t) gi] < tail_rows()) return false;
+        for (size_t g2 = 0; g2 < groups.size(); ++g2) {   // every group running decoder layers needs a chunk that holds the tail
+            bool dec = false;
+            for (int il = tail_first(); il < g.nl; ++il) dec = dec || L[(size_t) il].grp == (int) g2;
+            if (dec && (g2 >= chunk_steps.size() || chunk_steps[g2] < tail_rows())) return false;
+        }
+        // the head's group must run decoder layers too: pass 1 is what reads the last rows' h and takes their logits
+        bool head_dec = false;
+        for (int il = tail_first(); il < g.nl; ++il) head_dec = head_dec || L[(size_t) il].grp == devs[(size_t) head_dev].grp;
+        if (!head_dec) return false;
+        // every decoder layer must read the candidate source's compressed KV (a later KV source would have its own
+        // cache, and pass 1 never fills it for the decoder rows copied between the passes)
+        for (int il = tail_first(); il < g.nl; ++il)
+            if (L[(size_t) il].src >= 0 && srcs[(size_t) L[(size_t) il].src].layer != g.cand_src) return false;
+        return runs[(size_t) gi].T.back() >= tail_rows();   // (the source layer's last chunk holds the whole tail)
+    }
+    bool tail_alloc(std::string& err) {
+        if (tail_host == nullptr && !halloc(tail_host, chunk_hand_bytes(tail_rows()), err)) return false;
+        tail_host_b = chunk_hand_bytes(tail_rows());
+        return true;
+    }
+    // the candidate source's rows [0, rows) copied to every device that has decoder layers: the decoder pass reads
+    // them in place instead of pulling each chunk over the pipelined staging
+    bool tail_sync_src(int64_t rows, std::string& err) {
+        if (g.cand_src < 0) return true;
+        int ci = -1;   // (srcs is the compact list of the KV sources: find the candidate's entry by its layer)
+        for (size_t i = 0; i < srcs.size(); ++i)
+            if (srcs[i].layer == g.cand_src) { ci = (int) i; break; }
+        if (ci < 0) {
+            err = "internal: the decoder tail's source layer has no cache";
+            return false;
+        }
+        Src& sr = srcs[(size_t) ci];
+        const int from = L[(size_t) g.cand_src].dev;
+        rows = std::min<int64_t>(rows / std::max(1, sr.ratio), sr.cap);
+        if (rows <= 0) return true;
+        const size_t cb = (size_t) rows * ckv_rb(), ib = (size_t) rows * ik_rb();
+        if (src_host == nullptr || src_host_b < cb + ib) {
+            if (!halloc(src_host, cb + ib, err)) return false;
+            src_host_b = cb + ib;
+        }
+        Dev& d = devs[(size_t) from];
+        cudaSetDevice(d.id);
+        CK(cudaStreamSynchronize(d.st));
+        if (sr.ckv[(size_t) from] != nullptr)
+            CK(cudaMemcpyAsync(src_host, sr.ckv[(size_t) from], cb, cudaMemcpyDeviceToHost, d.st));
+        if (sr.ik[(size_t) from] != nullptr)
+            CK(cudaMemcpyAsync(src_host + cb, sr.ik[(size_t) from], ib, cudaMemcpyDeviceToHost, d.st));
+        CK(cudaStreamSynchronize(d.st));
+        for (int di : sr.readers) {   // (the devices outside the source's group: the same-group members compute it themselves)
+            bool dec = false;
+            for (int il = tail_first(); il < g.nl && !dec; ++il)
+                for (int m = 0; m < L[(size_t) il].nm && !dec; ++m)
+                    dec = member(L[(size_t) il], m).dev == di;
+            if (!dec) continue;   // (no decoder layer here: it will not read the source in the tail pass)
+            Dev& o = devs[(size_t) di];
+            cudaSetDevice(o.id);
+            if (sr.ckv[(size_t) di] != nullptr) CK(cudaMemcpyAsync(sr.ckv[(size_t) di], src_host, cb, cudaMemcpyHostToDevice, o.st));
+            if (sr.ik[(size_t) di] != nullptr) CK(cudaMemcpyAsync(sr.ik[(size_t) di], src_host + cb, ib, cudaMemcpyHostToDevice, o.st));
+            CK(cudaStreamSynchronize(o.st));
+        }
+        cudaSetDevice(d.id);
+        return true;
+    }
+
+    // ---- live telemetry: what each device is doing (the Monitor's Prefill and Loan windows), at most four lines a
+    // second a device.  The server takes LIVE lines in its reader thread; a request's stream never sees them.
+    struct LiveDev {
+        std::atomic<int64_t> stamp{0};
+        std::atomic<int> stage{0}, il{-1}, k{0}, nk{0};
+        std::atomic<int64_t> p0{0}, done{0}, total{0};
+        std::atomic<int> T{0};
+    };
+    std::unique_ptr<LiveDev[]> live_dev;
+    std::atomic<bool> live_on{false};
+    std::mutex live_mu;
+    int64_t live_base = 0, live_ntot = 0;   // (the feed's first token and length; written before the workers start)
+    void live_line(int di, int stage, int il, int k, int nk, int64_t p0, int T, const char* path = "flow") {
+        if (!live_on.load(std::memory_order_relaxed) || !live_dev) return;
+        if (di < 0 || (size_t) di >= devs.size()) return;
+        LiveDev& v = live_dev[(size_t) di];
+        const int64_t t = (int64_t) now_ms();
+        int64_t last = v.stamp.load(std::memory_order_relaxed);
+        if (t - last < 250) return;
+        if (!v.stamp.compare_exchange_strong(last, t)) return;   // (another layer of the same device is printing)
+        v.stage.store(stage, std::memory_order_relaxed);
+        v.il.store(il, std::memory_order_relaxed);
+        v.k.store(k, std::memory_order_relaxed);
+        v.nk.store(nk, std::memory_order_relaxed);
+        v.p0.store(p0, std::memory_order_relaxed);
+        v.T.store(T, std::memory_order_relaxed);
+        const int64_t done = stage == 2 ? 0 : std::max<int64_t>(0, std::min<int64_t>(live_ntot, p0 + T - live_base));
+        v.done.store(done, std::memory_order_relaxed);
+        v.total.store(stage == 2 ? 0 : live_ntot, std::memory_order_relaxed);
+        const Dev& d = devs[(size_t) di];
+        int perm = 0, lend = 0, mtp = 0;
+        for (const Layer& l : L)
+            for (int m = 0; m < l.nm; ++m) {
+                const Layer& x = member(l, m);
+                if (x.dev != di) continue;
+                if (l.mtp) mtp += l.n_lend;
+                else {
+                    perm += x.n_perm;
+                    lend += x.n_lend;
+                }
+            }
+        size_t fr = 0, tot = 0;
+        cudaSetDevice(d.id);
+        cudaMemGetInfo(&fr, &tot);
+        const char* sn = stage == 1 ? "tail" : stage == 2 ? "decode" : "prompt";
+        const int ch = d.grp < (int) chunk_steps.size() ? chunk_steps[(size_t) d.grp] : 0;
+        {
+            std::lock_guard<std::mutex> lk(live_mu);
+            std::fprintf(stdout,
+                         "LIVE dev=%d stage=%s path=%s layer=%d k=%d nk=%d p0=%lld T=%d done=%lld total=%lld "
+                         "arena=%zu perm=%d lend=%d mtp=%d free=%zu chunk=%d\n",
+                         d.id, sn, path, il, k, nk, (long long) p0, T, (long long) done,
+                         (long long) (stage == 2 ? 0 : live_ntot),
+                         d.arena_bytes >> 20, perm, lend, mtp, fr >> 20, ch);
+            std::fflush(stdout);
+        }
+    }
+
     bool run_dev_layers(int di, const Run& run, std::string& err) {
         Dev& d = devs[(size_t) di];
         Chunk& c = *chunks[(size_t) di];
@@ -6736,6 +6883,7 @@ struct Model::Impl {
                     }
                 }
                 if (!layer_chunk(L0, 0, p0, T, wp, S, err)) return false;
+                live_line(di, 0, il, k, nk, p0, T);
                 if (dump_l != nullptr) dump_layer(d, c.h, il, p0, T);
                 if (!last_l) {   // the chunk's state kept for the next layer
                     const Xfer x = chunk_xfer(c.lm_state + (size_t) k * hb, c, T, true);
@@ -6771,11 +6919,13 @@ struct Model::Impl {
 
     bool run_dev_chunks(int di, const std::vector<Run>& runs, std::string& err) {
         const Run& run = runs[(size_t) devs[(size_t) di].grp];   // (this device's group's run of chunks)
+        if (run.T.empty()) return true;   // (a pass with no chunk on this device: run_pass submits to every worker)
         Dev& d = devs[(size_t) di];
         Chunk& c = *chunks[(size_t) di];
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
         const int D = g.dim, H = g.hc, nk = (int) run.T.size();
+        const bool stage1 = run.stage == 1;   // (the decoder tail: layers after the candidate source layer only)
         Streamer S;
         const int B = std::max(1, c.ring_n / Chunk::kParts);
         if (c.flow) {   // (the flow decides its streams as the layers route; nothing planned here)
@@ -6788,7 +6938,9 @@ struct Model::Impl {
             c.fl_layers.clear();
             for (int il = 0; il < g.nl; ++il)   // (a group's layers: on each member)
                 for (int m = 0; m < L[(size_t) il].nm; ++m)
-                    if (member(L[(size_t) il], m).dev == di) c.fl_layers.push_back(il);
+                    if (member(L[(size_t) il], m).dev == di &&
+                        (!tail_mode || (stage1 ? il >= tail_first() : il <= g.cand_src)))
+                        c.fl_layers.push_back(il);
             c.fl_T = run.T;
             c.spec_k = c.spec_il = -1;
             c.wait_ms = 0;
@@ -6803,6 +6955,7 @@ struct Model::Impl {
         }
         for (int k = 0; k < nk && !c.flow; ++k)
             for (int il = 0; il < g.nl; ++il) {
+                if (tail_mode && (stage1 ? il < tail_first() : il > g.cand_src)) continue;
                 const Layer& L0 = L[(size_t) il];
                 bool here = false;
                 for (int m = 0; m < L0.nm; ++m) here = here || member(L0, m).dev == di;
@@ -6831,7 +6984,9 @@ struct Model::Impl {
         std::vector<int> egs;
         for (const Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m)
-                if (member(l0, m).dev == di && !l0.mtp && l0.eg >= 0) egs.push_back(l0.eg);
+                if (member(l0, m).dev == di && !l0.mtp && l0.eg >= 0 &&
+                    (!tail_mode || (stage1 ? l0.il >= tail_first() : l0.il <= g.cand_src)))
+                    egs.push_back(l0.eg);
         const size_t eg_per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * (pk.eg_hd + pk.eg_hd / 32);
         auto read_eg = [this, &c, &run, &egs, eg_per](int k) {
             if (k >= 2) cudaEventSynchronize(c.eg_ev[k % 2]);
@@ -6856,7 +7011,7 @@ struct Model::Impl {
             wp.win = run.seq[(size_t) k];
             wp.k = k;
             wp.snap_t = run.snap_pos >= p0 && run.snap_pos < p0 + T ? (int) (run.snap_pos - p0) : -1;
-            bool started = false;
+            bool started = false, ran = false;
             std::vector<char> got(srcs.size(), 0);
             for (int il = 0; il < g.nl; ++il) {
                 Layer& L0 = L[(size_t) il];
@@ -6864,9 +7019,19 @@ struct Model::Impl {
                 for (int m = 0; m < L0.nm; ++m)
                     if (member(L0, m).dev == di) mi = m;
                 if (mi < 0) continue;
-                if (!started) {   // the chunk's input: its embedding rows, or the previous group's hand-off
+                if (tail_mode && (stage1 ? il < tail_first() : il > g.cand_src)) continue;
+                ran = true;
+                if (!started) {   // the chunk's input: the tail's saved rows, its embedding rows, or the hand-off
                     started = true;
-                    if (il == 0) {
+                    if (stage1 && il == tail_first()) {
+                        if (tail_host == nullptr) {
+                            err = "internal: the decoder tail's rows are missing";
+                            return false;
+                        }
+                        const Xfer x = chunk_xfer_rows(tail_host, T, c, T, false, 0, 0);
+                        for (int i = 0; i < x.n; ++i)
+                            CK(cudaMemcpyAsync(x.dst[i], x.src[i], x.bytes[i], cudaMemcpyHostToDevice, s));
+                    } else if (il == 0) {
                         if (k >= 2) CK(cudaEventSynchronize(c.emb_ev[slot]));
                         for (int t = 0; t < T; ++t)
                             std::memcpy(c.emb_host[slot] + (size_t) t * D, emb_row(p0 + t, toks[(size_t) (p0 + t)]),
@@ -6893,6 +7058,7 @@ struct Model::Impl {
                 for (int sidx : {L0.src, L0.ix_src ? L0.ik_src : -1}) {
                     if (sidx < 0 || got[(size_t) sidx]) continue;
                     got[(size_t) sidx] = 1;
+                    if (tail_mode && stage1) continue;   // (the source's rows are in place: copied between the passes)
                     Src& sr = srcs[(size_t) sidx];
                     if (L[(size_t) sr.layer].grp == L0.grp) continue;
                     const Run& ur = runs[(size_t) L[(size_t) sr.layer].grp];
@@ -6931,18 +7097,28 @@ struct Model::Impl {
                 }
                 if (!layer_chunk(L0, mi, p0, T, wp, S, err)) return false;
                 if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, il, p0, T);
+                live_line(di, stage1 ? 1 : 0, il, k, nk, p0, T);
+                if (!stage1 && tail_mode && L0.il == g.cand_src && mi == 0 && last_k) {   // the tail's input rows
+                    if (!tail_alloc(err)) return false;
+                    if (T >= tail_rows()) {
+                        const Xfer x = chunk_xfer_rows(tail_host, tail_rows(), c, tail_rows(), true, 0, T - tail_rows());
+                        for (int i = 0; i < x.n; ++i)
+                            CK(cudaMemcpyAsync(x.dst[i], x.src[i], x.bytes[i], cudaMemcpyDeviceToHost, s));
+                    }
+                }
                 const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
-                if (last && mi == 0 && il + 1 < g.nl) {   // the hand-off, once the next group took the chunk before last
+                const bool next_runs = !tail_mode || (stage1 ? il + 1 >= tail_first() : il + 1 <= g.cand_src);
+                if (last && next_runs && mi == 0 && il + 1 < g.nl) {   // the hand-off, once the next group took the chunk before last
                     const int nnext = L[(size_t) il + 1].nm;
                     if (k >= 2) wait_flags(c.hand_ack + (size_t) slot * 8 * 32, nnext, 32, wp.win - 2, s);
                     xfer_put(chunk_xfer(c.hand[slot], c, T, true), c.hand_flag[slot], wp.win, d.xcnt, s);
                 }
             }
-            if (di == head_dev && (size_t) k < chunk_done.size()) {
+            if (ran && di == chunk_prog_dev && (size_t) k < chunk_done.size()) {
                 CK(cudaEventRecord(chunk_done[(size_t) k], s));
                 chunk_rec[(size_t) k].store(1, std::memory_order_release);
             }
-            if (d.grp == devs[(size_t) head_dev].grp) {   // the head group: each member its share of the logits
+            if (ran && d.grp == devs[(size_t) head_dev].grp) {   // the head group: each member its share of the logits
                 if (logits_all) {   // every row's logits (tests): the head over the chunk's rows, 16 at a time
                     const size_t base = (size_t) (p0 - run.p0[0]) * g.vocab;
                     for (int r0 = 0; r0 < T; r0 += kWin) {
@@ -7151,7 +7327,11 @@ struct Model::Impl {
     // faster (by half, with less than kPickRes in RAM); said with --verbose
     bool pick_path(int n) {
         pm.last = -1;
-        if (!pm.on || n >= kPickMax) return true;
+        if (!pm.on || n >= kPickMax) {
+            pm.last = 1;   // (the flow: the Monitor's Prefill tab says which path this prompt takes)
+            st.path = 1;
+            return true;
+        }
         double f_res = 0, f_cold = 0, w = 0;
         const int nw = n / kWin, rem = n % kWin;
         for (int il = 0; il < g.nl; ++il) {
@@ -7191,6 +7371,7 @@ struct Model::Impl {
         const double res_share = f_res / std::max(1.0, f_res + f_cold);
         const bool flow = !(pw < pf && (res_share >= kPickRes || 2.0 * pw <= pf));
         pm.last = flow ? 1 : 0;
+        st.path = pm.last;
         pm.last_cls = cls;
         pm.last_nw = n_win;
         pm.last_pred = flow ? t_flow : t_win;
@@ -7354,7 +7535,34 @@ struct Model::Impl {
                 r.seq.push_back(++win_seq);
             }
         }
-        const Run& hrun = runs[(size_t) devs[(size_t) head_dev].grp];   // the head's run: T_last, n_logits, progress
+        // the decoder tail (DS4_TAIL_PREFILL): the layers after the candidate source layer run a second pass over the
+        // last rows only.  The source layer's last chunk must hold the whole tail (its saved h | pre | topk | cand);
+        // the runs below still tile the whole prompt for the first pass.
+        const bool tail_on = tail_feed(runs, n, logits_rows);
+        std::vector<Run> truns;
+        if (tail_on) {
+            truns.resize(groups.size());
+            const int64_t t0 = pos + n - tail_rows();
+            for (size_t gi = 0; gi < groups.size(); ++gi) {
+                bool dec = false;
+                for (int il = tail_first(); il < g.nl; ++il) dec = dec || L[(size_t) il].grp == (int) gi;
+                if (!dec) continue;
+                Run& r = truns[gi];
+                r.p0.push_back(t0);
+                r.T.push_back(tail_rows());
+                r.seq.push_back(++win_seq);
+                r.stage = 1;
+                if (snap_slot >= 0) r.snap_pos = pos + n - 1;
+            }
+        }
+        int prog0 = head_dev;
+        if (tail_on) {   // (the head's group is decoder-only: the progress follows the last encoder layer's device)
+            prog0 = -1;
+            for (int il = 0; il <= g.cand_src && il < g.nl; ++il) prog0 = L[(size_t) il].dev;
+        }
+        const Run& prun = runs[(size_t) devs[(size_t) prog0].grp];   // the first pass's progress
+        const Run& frun = tail_on ? truns[(size_t) devs[(size_t) head_dev].grp]   // T_last, n_logits, the taps
+                                  : runs[(size_t) devs[(size_t) head_dev].grp];
         for (const Run& r : runs) {   // each run tiles [pos, pos + n) exactly, every chunk within its group's step
             int64_t at = pos;
             bool ok = !r.T.empty();
@@ -7386,12 +7594,12 @@ struct Model::Impl {
                     return false;
             }
         }
-        const int T_last = hrun.T.back();
+        const int T_last = frun.T.back();
         n_logits = logits_all ? 0 : std::min(logits_rows, T_last);
         const double tl = now_ms();
-        {   // each chunk's end on the head device, for the progress reports
-            cudaSetDevice(devs[(size_t) head_dev].id);
-            while (chunk_done.size() < hrun.T.size()) {
+        {   // each chunk's end on the progress device, for the progress reports
+            cudaSetDevice(devs[(size_t) prog0].id);
+            while (chunk_done.size() < prun.T.size()) {
                 cudaEvent_t e = nullptr;
                 CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
                 chunk_done.push_back(e);
@@ -7400,7 +7608,7 @@ struct Model::Impl {
             for (size_t i = 0; i < chunk_done.size(); ++i) chunk_rec[i].store(0);
         }
         prof_chunk = prof_on;
-        const bool lm = lm_begin(hrun);   // (one device only: the head's run is the run)
+        const bool lm = lm_begin(prun);   // (one device only: the head's run is the run)
         struct LmEnd {   // (every way out: its host memory freed once the device is done with it)
             Impl* p;
             bool on;
@@ -7408,34 +7616,72 @@ struct Model::Impl {
                 if (on) p->lm_end();
             }
         } lm_end_{this, lm};
-        std::vector<std::string> errs(devs.size());
-        for (size_t di = 0; di < devs.size(); ++di)
-            workers[di]->submit([this, di, &runs, &errs] {
-                std::string e;
-                if (!run_dev_chunks((int) di, runs, e)) errs[di] = e.empty() ? "a device's thread failed" : e;
-            });
-        size_t reported = 0;
-        for (;;) {
-            bool all = true;
-            for (auto& w : workers) all = all && w->idle();
-            if (progress && lm) {   // (layer-major: the share of the layers every chunk went through)
-                const int nd = lm_layers.load(std::memory_order_acquire);
-                if (nd > 0 && nd < g.nl) progress((int64_t) n * nd / g.nl);
-            } else if (progress) {   // chunks through every layer (the last layer's device past their event)
-                while (reported < hrun.T.size() && chunk_rec[reported].load(std::memory_order_acquire) &&
-                       cudaEventQuery(chunk_done[reported]) == cudaSuccess)
-                    ++reported;
-                if (reported > 0 && reported < hrun.T.size())
-                    progress(hrun.p0[reported - 1] + hrun.T[reported - 1] - hrun.p0[0]);
+        tail_mode = tail_on;
+        struct TailEnd {   // (every way out: no pass keeps the tail's source/filter rules)
+            Impl* p;
+            ~TailEnd() {
+                p->tail_mode = false;
+                p->chunk_prog_dev = -1;
             }
-            if (all) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        } tail_end_{this};
+        // one pass over the split: every device's worker, the progress from the device the prompt's chunks are
+        // followed on (the tail pass reports nothing: only its last rows are the prompt's own reading)
+        auto run_pass = [&](std::vector<Run>& rr, int prog, bool report) -> bool {
+            chunk_prog_dev = report ? prog : -1;
+            pass_devs.assign(devs.size(), 0);
+            for (size_t di = 0; di < devs.size(); ++di) {
+                bool any = false;
+                const Run& gr = rr[(size_t) devs[di].grp];
+                const bool stage1 = gr.stage == 1;
+                if (!gr.T.empty())   // (a group without a run in this pass has no layer in it, whatever its stage says)
+                    for (int il = 0; il < g.nl && !any; ++il) {
+                        if (tail_mode && (stage1 ? il < tail_first() : il > g.cand_src)) continue;
+                        for (int m = 0; m < L[(size_t) il].nm && !any; ++m) any = member(L[(size_t) il], m).dev == (int) di;
+                    }
+                pass_devs[di] = any ? 1 : 0;
+            }
+            std::vector<std::string> errs(devs.size());
+            for (size_t di = 0; di < devs.size(); ++di)
+                workers[di]->submit([this, di, &rr, &errs] {
+                    std::string e;
+                    if (!run_dev_chunks((int) di, rr, e)) errs[di] = e.empty() ? "a device's thread failed" : e;
+                });
+            size_t reported = 0;
+            const Run& rp = rr[(size_t) devs[(size_t) prog].grp];
+            for (;;) {
+                bool all = true;
+                for (auto& w : workers) all = all && w->idle();
+                if (report && progress && lm) {   // (layer-major: the share of the layers every chunk went through)
+                    const int nd = lm_layers.load(std::memory_order_acquire);
+                    if (nd > 0 && nd < g.nl) progress((int64_t) n * nd / g.nl);
+                } else if (report && progress) {   // chunks through every layer (the progress device past their event)
+                    while (reported < rp.T.size() && chunk_rec[reported].load(std::memory_order_acquire) &&
+                           cudaEventQuery(chunk_done[reported]) == cudaSuccess)
+                        ++reported;
+                    if (reported > 0 && reported < rp.T.size())
+                        progress(rp.p0[reported - 1] + rp.T[reported - 1] - rp.p0[0]);
+                }
+                if (all) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            for (const std::string& e : errs)
+                if (!e.empty()) {
+                    err = e;
+                    return false;
+                }
+            return true;
+        };
+        live_base = pos;
+        live_ntot = n;
+        if (!run_pass(runs, prog0, true)) return false;
+        if (tail_on) {   // all first-pass work landed: the tail's rows to the host, the source's rows to every reader
+            for (Dev& dv : devs) {
+                cudaSetDevice(dv.id);
+                CK(cudaStreamSynchronize(dv.st));
+            }
+            if (!tail_sync_src(pos + n, err)) return false;
+            if (!run_pass(truns, head_dev, false)) return false;
         }
-        for (const std::string& e : errs)
-            if (!e.empty()) {
-                err = e;
-                return false;
-            }
         st.layer_ms += now_ms() - tl;
         eg_stats();
         Dev& d = devs[(size_t) head_dev];
@@ -7481,8 +7727,8 @@ struct Model::Impl {
                              (unsigned long long) c.it_spec_unused, c.wait_ms);
             }
         }
-        if (pm.on && hrun.T.size() == 1) {   // (the picks' spread for pick_path: the CPU-lane experts this run picked)
-            bool tp = false;
+        if (pm.on && !tail_on && frun.T.size() == 1) {   // (the picks' spread for pick_path: the CPU-lane experts this
+            bool tp = false;                             // run picked - never the tail pass's own, it is not a prompt)
             for (const Layer& l : L) tp = tp || l.nm > 1;
             double picked = 0;
             for (const auto& cp : chunks)
@@ -7497,13 +7743,13 @@ struct Model::Impl {
         int tap_n = T_last;   // the drafter's seed: the last rows of every tapping group's last chunk (the shortest one:
         for (int il : g.d_targets)   // a group's last chunk can be shorter than the head's - e.g. n = 8321)
             if (il >= 0 && il < (int) L.size())
-                tap_n = std::min(tap_n, runs[(size_t) devs[(size_t) L[(size_t) il].dev].grp].T.back());
+                tap_n = std::min(tap_n, (tail_on ? truns : runs)[(size_t) devs[(size_t) L[(size_t) il].dev].grp].T.back());
         const int nr = std::min(tap_n, tap_cap);
         if (!seed_drafter(pos - nr, nr, 0, err)) return false;
         if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
             // the next feed seeds them again from its own rows, past this position)
             Check& ckp = ck[snap_slot & 1];
-            ckp.pos = hrun.snap_pos;
+            ckp.pos = frun.snap_pos;
             ckp.win.resize(L.size());
             ckp.comp.resize(L.size() * 2);
             for (size_t i = 0; i < L.size(); ++i) {
@@ -7848,6 +8094,7 @@ struct Model::Impl {
             }
             if (mi == 0 && !tap(d, il, T, err)) return false;
             if (!layer(L0, mi, p0, T, wp, err)) return false;
+            live_line(di, 2, il, 0, 1, p0, T, "windows");
             if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, il, p0, T);
             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
             if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
@@ -8588,6 +8835,7 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
         if (ok) p.path_done(now_ms() - t0);
         return ok;
     }
+    p.st.path = 0;   // (windows of 16: the Monitor's Prefill tab)
     return p.feed_windows(tokens, n, logits_rows, err);
 }
 bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
@@ -8600,6 +8848,7 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
         return ok;
     }
     if (n > 1 && !p.feed_windows(tokens, n - 1, 0, err)) return false;
+    p.st.path = 0;   // (windows of 16: the Monitor's Prefill tab)
     p.checkpoint(slot);
     const bool ok = n < 1 || p.feed_windows(tokens + n - 1, 1, logits_rows, err);
     if (ok) p.path_done(now_ms() - t0);   // (windows, when pick_path chose them)
@@ -8607,6 +8856,7 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
 }
 int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) p_->o.max_context) : kWin; }
 void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
+void Model::set_live(bool on) { p_->live_on.store(on); }
 int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
     return p_->sample(t, tp, tk, mp, seed, counter);
 }

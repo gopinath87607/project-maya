@@ -379,8 +379,21 @@ const sumBy = (xs, f) => xs.reduce((a, x) => a + (num(f(x)) || 0), 0);
 // the Monitor's card rows: the biggest VRAM first, then the smaller ones (a display order only - the engine's split,
 // its layer order and the prefill chain keep the order it placed them in)
 const bigFirst = (gs) => gs.slice().sort((a, b) => (b.total || 0) - (a.total || 0) || (a.dev - b.dev));
+// the LIVE rows that are still fresh: the engine prints them at most four a second a card and stops when a prompt
+// ends, so an older row is the last prompt's - the page fades it rather than pretending it is now
+const LIVE_FRESH_S = 3;
+const liveRows = (m) => ((m && m.live_prog) || []).filter((r) => num(r.age) == null || r.age <= LIVE_FRESH_S);
+// a live row's stage: the flow's encoder pass (prompt), its decoder pass on the last rows (tail), or a decode step -
+// the engine's window-by-window path calls every window "decode", and the request state tells a prompt's apart
+const liveStage = (r, reading) => !r ? null
+  : r.stage === "tail" ? "tail"
+  : r.stage === "prompt" ? "prompt"
+  : reading ? "windows" : "decode";
 function phaseOf(m) {
-  if ((m.live || {}).state === "reading") return 0;         // a prompt holds the arena now
+  const rows = liveRows(m), state = (m.live || {}).state;
+  if (rows.some((r) => r.stage === "prompt" || r.stage === "tail")) return 0;   // a prompt holds the arena now
+  if (rows.length && state === "generating") return 1;      // a card is decoding: its arena is expert slots again
+  if (state === "reading") return 0;                        // (the windows path says "decode" on its live rows)
   const st = (m.tiers || {}).now || {};
   return num(st.phase) == null ? 0 : +st.phase;              // the engine's last layout
 }
@@ -496,6 +509,12 @@ function gpuOf(m, g) {   // NVML's reading of the card the engine reported (join
   const cards = (m.hardware || {}).gpus || [];
   return (g.pci && cards.find((c) => c.pci === g.pci)) || cards[g.dev] || null;
 }
+// the card's label: NVML's own index (the one nvidia-smi prints) when the join found it - a config's GPU order can
+// put the engine's device 1 on nvidia-smi's card 2, and the Monitor should name the card the user knows
+function cardLabel(m, g) {
+  const card = gpuOf(m, g);
+  return card && num(card.index) != null ? card.index : g.dev;
+}
 function gpuNameCls(g) { return g && g.name ? g.name.replace(/^NVIDIA /, "").replace(/^GeForce /, "").replace(/^AMD /, "").replace(/^Radeon /, "") : ""; }
 // a card's layers from its LEND line.  Its last index can run past the next card's first (the drafter's blocks sit after
 // the trunk on the card that holds them), so the range stops at the next card's first layer: "0–9", not "0–42"
@@ -516,6 +535,7 @@ function renderGpuPanel(m) {
   if (!gs.length) { card.hidden = true; return; }
   card.hidden = false;
   const phase = phaseOf(m);
+  const rows = liveRows(m), byDev = new Map(rows.map((r) => [r.dev, r])), reading = (m.live || {}).state === "reading";
   const nExp = sumBy(gs, (g) => g.perm) + sumBy(gs, (g) => g.lend) + sumBy(gs, (g) => g.mtp);
   $("gpus-sub").textContent = `${gs.length} GPU${gs.length > 1 ? "s" : ""} · ${fmt(nExp)} expert slots on the cards` +
     ` · ${phase === 1 ? "the decoder holds the arenas" : "the prompts hold the arenas"}`;
@@ -533,10 +553,15 @@ function renderGpuPanel(m) {
     }
     segs.push({k: "free", v: g.free || 0, label: "free"});
     const held = (g.perm || 0) + (phase === 1 ? (g.lend || 0) + (g.mtp || 0) : 0);
+    const r = byDev.get(g.dev);       // (its live line while the card works: the free bytes now, the stage, the layer)
+    const freeMib = r ? num(r.free) : num(g.free);
+    const now = r ? [liveStage(r, reading), num(r.layer) != null && r.layer >= 0 ? `L${fmt(r.layer)}` : null]
+      .filter(Boolean).join(" ") : null;
     return `<div class="gpu-line">
-      <div class="gpu-line__name"><b>GPU ${esc(g.dev)}</b><span>${esc([name, layersOf(g, gs)].filter(Boolean).join(" · "))}</span></div>
+      <div class="gpu-line__name"><b>GPU ${esc(cardLabel(m, g))}</b><span>${esc([name, layersOf(g, gs)].filter(Boolean).join(" · "))}</span></div>
       ${mibBar(segs, g.total)}
-      <div class="gpu-line__nums"><b>${fmt(held)} experts</b><span>${fmt(g.free)} MiB free${g.chunk ? ` · chunk ${fmt(g.chunk)}` : ""}</span></div>
+      <div class="gpu-line__nums"><b>${fmt(held)} experts</b><span>${freeMib != null ? fmt(freeMib) : "–"} MiB free` +
+        `${now ? ` · ${esc(now)}` : ""}${g.chunk ? ` · chunk ${fmt(g.chunk)}` : ""}</span></div>
     </div>`;
   }).join("");
   mibLegend($("gpus-legend"), mibPartsFor(gs, phase));
@@ -553,6 +578,7 @@ function renderLendPanel(m) {
   if (!gs.length) { card.hidden = true; return; }
   card.hidden = false;
   const phase = phaseOf(m), hist = (m.tiers || {}).history || {};
+  const rows = liveRows(m), byDev = new Map(rows.map((r) => [r.dev, r])), reading = (m.live || {}).state === "reading";
   const perm = sumBy(gs, (g) => g.perm), lend = sumBy(gs, (g) => g.lend), mtp = sumBy(gs, (g) => g.mtp);
   const arena = sumBy(gs, (g) => g.arena), arenaMib = sumBy(gs, (g) => (g.lend_mib || 0) + (g.mtp_mib || 0));
   cardsInto($("lend-metrics"), [
@@ -562,8 +588,10 @@ function renderLendPanel(m) {
     {id: "lend-perm", label: "Permanent experts", icon: "gpu"},
   ]);
   const lentNow = phase === 1 ? lend + mtp : 0;
-  setCard("lend-now", fmt(lentNow), "", phase === 1 ? `${fmt(lend)} trunk + ${fmt(mtp)} drafter, in the arenas`
-                                                    : "the prompt holds the arenas now");
+  const freeNow = rows.length ? sumBy(rows, (r) => r.free) : null;
+  setCard("lend-now", fmt(lentNow), "", (phase === 1 ? `${fmt(lend)} trunk + ${fmt(mtp)} drafter, in the arenas`
+                                                     : "the prompt holds the arenas now") +
+          (freeNow != null ? ` · ${fmt(freeNow)} MiB free now` : ""));
   if (num(stat.lend_n) != null) {
     setCard("lend-refill", fmt(stat.lend_n), " experts",
             `${fmt(stat.lend_gb, 2)} GB in ${fmt(stat.lend_ms)} ms`);
@@ -580,6 +608,10 @@ function renderLendPanel(m) {
   $("lend-rows").innerHTML = gs.map((g) => {
     const read = gpuOf(m, g), name = gpuNameCls(read);
     const ex = (g.lend_mib || 0) + (g.mtp_mib || 0);
+    const r = byDev.get(g.dev);
+    const freeMib = r ? num(r.free) : num(g.free);    // the card's free bytes now (its live line), else at the layout
+    const nowTxt = r ? [liveStage(r, reading), num(r.layer) != null && r.layer >= 0 ? `L${fmt(r.layer)}` : null]
+      .filter(Boolean).join(" ") : null;
     const segs = [{k: "weights", v: (g.weights || 0) + (g.caches || 0), label: "weights"},
                   {k: "pool", v: g.perm_mib || 0, label: "permanent experts"},
                   phase === 1
@@ -589,24 +621,28 @@ function renderLendPanel(m) {
                   phase === 1 ? {k: "spare", v: Math.max(0, (g.arena || 0) - ex), label: "arena spare"} : null,
                   {k: "free", v: g.free || 0, label: "free"}].filter(Boolean);
     return `<div class="lend-row">
-      <div class="lend-row__name"><b>GPU ${esc(g.dev)}</b><span>${esc([name, layersOf(g, gs)].filter(Boolean).join(" · "))}</span></div>
+      <div class="lend-row__name"><b>GPU ${esc(cardLabel(m, g))}</b><span>${esc([name, layersOf(g, gs)].filter(Boolean).join(" · "))}</span></div>
       ${mibBar(segs, g.total)}
       <div class="lend-row__nums"><b>${fmt(g.perm)} + ${fmt((g.lend || 0) + (g.mtp || 0))}</b>
-        <span>perm + ${phase === 1 ? "lent now" : "lent when decoding"} · arena ${fmt((g.arena || 0) / 1024, 2)} GB</span></div>
+        <span>perm + ${phase === 1 ? "lent now" : "lent when decoding"} · arena ${fmt((g.arena || 0) / 1024, 2)} GB` +
+        `${freeMib != null ? ` · free ${fmt(freeMib)} MiB` : ""}${nowTxt ? ` · now ${esc(nowTxt)}` : ""}</span></div>
     </div>`;
   }).join("");
   mibLegend($("lend-legend"), mibPartsFor(gs, phase));
   $("lend-note").textContent = "The arena is the same bytes twice: while a prompt is read they are its orange chunk " +
     "buffers; when the prompt ends the decoder borrows them back as expert slots — teal for the trunk, pink for the " +
-    "drafter — and fills them from the last refill (its experts, the GB of weights copied, the ms it took). GB on this " +
-    "tab is bytes of VRAM summed over the cards; \"perm + lent\" under a bar is that card's experts held in both phases plus " +
-    "the slots its arena adds when the model answers.";
+    "drafter — and fills them from the last refill (its experts, the GB of weights copied, the ms it took). A card's row " +
+    "also carries its live line while it works: the MiB free on it now, and the stage and layer it is on (prompt, the " +
+    "decoder tail's last rows, or a decode step). GB on this tab is bytes of VRAM summed over the cards; \"perm + lent\" " +
+    "under a bar is that card's experts held in both phases plus the slots its arena adds when the model answers.";
 }
 
-// Prefill: the engine's chunk per card, its path and the rate it read at
+// Prefill: the engine's chunk per card, its path, the rate it read at - and, live, where each card is right now
 function renderPrefillPanel(m) {
   const card = $("prefill-card"), gs = bigFirst(m.lend || []), eng = m.engine || {}, stat = (m.tiers || {}).now || {};
-  const live = m.live || {}, hist = (m.history || {}), last = (m.requests || [])[0];
+  const live = m.live || {}, hist = (m.history || {}), last = (m.requests || [])[0], rows = liveRows(m);
+  const byDev = new Map(rows.map((r) => [r.dev, r]));
+  const reading = live.state === "reading";
   // the pipeline's own order: layer 0's card first, whatever the cards' sizes (the GPU and Loan tabs keep big card first)
   const start = (g) => { const L = g.layers || []; return L.length ? L[0] : 1e9; };
   const chunks = gs.filter((g) => (g.chunk || 0) > 0).slice().sort((a, b) => start(a) - start(b));
@@ -617,6 +653,9 @@ function renderPrefillPanel(m) {
                 : last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null)
              : null;
   const steps = String(eng.prefill_steps || "").split(",").filter((x) => +x > 0).map((x) => fmt(+x));
+  // the prompt as a whole (the engine's PP lines, the windows path included): its read tokens against its length
+  const pRead = reading ? num(live.prompt_read) : null, pTotal = reading ? num(live.prompt_total) : null;
+  const pct = pRead != null && pTotal ? Math.min(100, 100 * pRead / pTotal) : null;
   cardsInto($("prefill-metrics"), [
     {id: "pf-rate", label: "Read rate", icon: "bolt"},
     {id: "pf-chunk", label: "Chunk", icon: "layers"},
@@ -624,17 +663,37 @@ function renderPrefillPanel(m) {
     {id: "pf-prompt", label: "Last prompt", icon: "chat"},
   ]);
   setCard("pf-rate", rate == null ? null : fmt(rate), " tok/s",
-          live.state === "reading" ? "reading now" : last ? "last request" : "waiting for a prompt");
+          reading && pct != null ? `reading now · ${fmt(pRead)}/${fmt(pTotal)} tokens (${fmt(pct)}%)`
+          : reading ? "reading now" : last ? "last request" : "waiting for a prompt");
   setCard("pf-chunk", eng.prefill_chunk ? fmt(eng.prefill_chunk) : (chunks[0] ? fmt(chunks[0].chunk) : null), " tokens",
           steps.length > 1 ? `steps ${steps.join(" → ")}` : "a chunk a pass");
-  const path = typeof stat.path === "string" ? stat.path : null;
-  setCard("pf-path", path || null, "", path === "flow" ? "the flow: each expert read once a layer, at once"
-                                   : path === "windows" ? "windows of 16 tokens" : "the engine picks it a prompt");
+  const pathN = num(stat.path);   // STAT's path: 1 the chunked pass (the flow), 0 windows of 16
+  const path = pathN === 1 ? "flow" : pathN === 0 ? "windows" : null;
+  setCard("pf-path", path, "", path === "flow" ? "the chunked pass: each expert read once a layer, at once"
+                                  : path === "windows" ? "windows of 16 tokens" : "the engine picks it a prompt");
   setCard("pf-prompt", last ? fmt(last.prompt_tokens) : (live.prompt_tokens != null ? fmt(live.prompt_tokens) : null),
           " tokens", last ? `${fmt(last.reused)} reused from the conversation` : "");
   spark("pf-rate-p", (hist.prefill_tok_s_mean || []).map((x) => x || 0));
-  $("prefill-sub").textContent = `${chunks.length || gs.length} GPU${(chunks.length || gs.length) > 1 ? "s" : ""} reading in parallel`;
-  // the pipeline's own order: the layer each card starts at (0-9, 10-19, 20-29, 30-39), whatever the rows' size order
+  const stageName = (r) => liveStage(r, reading);
+  const nowCell = (r) => {
+    if (!r) return "–";
+    const l = num(r.layer), k = num(r.k), nk = num(r.nk), T = num(r.T), p0 = num(r.p0);
+    const parts = [stageName(r)];
+    if (l != null && l >= 0) parts.push(`L${fmt(l)}`);
+    if (k != null && nk != null && nk > 1) parts.push(`chunk ${k + 1}/${nk}`);
+    if (p0 != null && T != null) parts.push(`@${fmt(p0 + T)}`);
+    return parts.filter(Boolean).join(" · ");
+  };
+  const readCell = (r) => {
+    const d = num(r && r.done), t = num(r && r.total);
+    return !t ? "–" : `${fmt(100 * d / t)}%`;
+  };
+  const tailOn = rows.some((r) => r.stage === "tail");
+  const n = chunks.length || gs.length;
+  $("prefill-sub").textContent = reading
+    ? `${n} GPU${n > 1 ? "s" : ""} reading now${tailOn ? " · the decoder tail" : ""}`
+    : `${n} GPU${n > 1 ? "s" : ""} · the last prompt's chunks`;
+  // the pipeline's own order: the layer each card starts at, whatever the rows' size order
   const stage = (g) => {
     const L = g.layers || [], first = L.length ? L[0] : null;
     if (first == null) return "–";
@@ -643,18 +702,25 @@ function renderPrefillPanel(m) {
     return i < 0 ? "–" : i + 1;
   };
   $("prefill-chunks").innerHTML = chunks.length ? `<table class="st-table">
-      <thead><tr><th>GPU</th><th>Stage</th><th>Card</th><th>Layers</th><th class="num">Chunk</th></tr></thead><tbody>` +
-    chunks.map((g) => `<tr><td>GPU ${esc(g.dev)}</td><td>${stage(g)}</td><td>${esc(gpuNameCls(gpuOf(m, g)) || "–")}</td>
+      <thead><tr><th>GPU</th><th>Stage</th><th>Card</th><th>Layers</th><th class="num">Chunk</th><th>Now</th>
+      <th class="num">Read</th></tr></thead><tbody>` +
+    chunks.map((g) => {
+      const r = byDev.get(g.dev);
+      return `<tr><td>GPU ${esc(cardLabel(m, g))}</td><td>${stage(g)}</td><td>${esc(gpuNameCls(gpuOf(m, g)) || "–")}</td>
       <td>${layersOf(g, gs) || "–"}</td>
-      <td class="num">${fmt(g.chunk)} tokens</td></tr>`).join("") + `</tbody></table>` : "";
+      <td class="num">${fmt(g.chunk)} tokens</td>
+      <td>${esc(nowCell(r))}</td><td class="num">${readCell(r)}</td></tr>`;
+    }).join("") + `</tbody></table>` : "";
   mibLegend($("prefill-legend"), [{k: "prompt"}, {k: "lend"}, {k: "mtp"}]);
   $("prefill-note").textContent = chunks.length
-    ? "Rows follow the pipeline: a prompt walks the trunk blocks in layer order — here GPU 0's 0–9 first and GPU 3's " +
-      "30–39 last — and Stage is the card's place in that order (1, 2, 3, 4 here). Chunk is how many prompt tokens that card reads per pass " +
-      "(--prefill-chunk-max): a length of text, not memory. Bigger chunks read each expert once a prompt instead of " +
-      "twice, but take VRAM the expert banks would otherwise hold. The colour key is those same bytes on the GPUs and " +
-      "Loan tabs: orange is these chunk buffers while a prompt is read; teal and pink are what the decoder swaps into " +
-      "the same bytes afterwards."
+    ? "Rows follow the pipeline: a prompt walks the trunk blocks in layer order, from the card that owns layer 0 to " +
+      "the one that owns the last layer, and Stage is the card's place in that order. Chunk is how many prompt tokens " +
+      "that card reads per pass (--prefill-chunk-max): a length of text, not memory. The Now column is each card's live " +
+      "line (at most four a second): the stage it is in — prompt, the decoder tail's last rows, or a decode step — the " +
+      "layer it last ran, its chunk of the pass, and the token position it reached; Read is how much of the pass it has " +
+      "done. Bigger chunks read each expert once a prompt instead of twice, but take VRAM the expert banks would " +
+      "otherwise hold. The colour key is those same bytes on the GPUs and Loan tabs: orange is these chunk buffers " +
+      "while a prompt is read; teal and pink are what the decoder swaps into the same bytes afterwards."
     : "";
 }
 

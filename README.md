@@ -119,6 +119,11 @@ Prefill is an 8K-token prompt. The speed holds as a conversation grows, and the 
 slowest while the caches fill with what you use. Share yours: `--bench`, then `--report`, in a
 [GitHub issue](https://github.com/mw00/project-maya/issues).
 
+**This fork's DeepSeek-V4.1-Flash run:** on Gopi's machine (2x RTX 3060 12 GB + 2x RTX 5060 8 GB, Xeon E5-2680 v4,
+247 GB RAM) a **111,124-token prompt is read at 576 tokens/s** (about 193 s), up from **344 tokens/s** before the
+encoder/decoder split: the encoder layers (0-20) run over every token, the decoder layers (21-39) only over the last
+2,560 rows, with `DS4_SPLIT=5,5,6,24` and `DS4_TAIL_PREFILL=1`.
+
 **Several requests at once** (`--parallel`) add up: on one GPU a token of each goes through the model together, so
 the dense weights are read once for all of them. In tokens per second for all of them together, against the same
 questions one after another: x1.41 for two and x1.35 for four on a V100 that streams most of Maya-S's experts from

@@ -434,6 +434,7 @@ class StrataEngine:
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.vram = []                   # VRAM lines: what each part holds on its GPU (the Monitor's GPU map)
         self.lend = {}                   # LEND lines by device: each GPU's experts, its prompt arena, its chunk
+        self.live_prog = {}              # LIVE lines by device: where the prompt is now (stage, layer, chunk) + the loan
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total, reuse, ms) prompt progress while a prompt is read, from PP lines
         try:                             # a ready-made engine's BUILD.json says its version
@@ -520,6 +521,9 @@ class StrataEngine:
         for line in self.proc.stdout:
             if line.startswith("LEND "):   # the engine's GPUs as it found them (a line a card, whatever the count)
                 self._parse_lend(line)
+                continue
+            if line.startswith("LIVE "):   # where each card is right now (prompt stage, layer, chunk, the loan): the
+                self._parse_live(line)     # Monitor's live rows - never a request's line, so it stops here
                 continue
             if self.multi and self._route(line):
                 continue
@@ -681,6 +685,20 @@ class StrataEngine:
             row[k] = int(v) if v.lstrip("-").isdigit() else v
         if "dev" in row:
             self.lend[row["dev"]] = row
+
+    def _parse_live(self, line):
+        """LIVE dev=... stage=prompt|tail|decode path=flow layer=N k=KI nk=NK p0=P T=T done=D total=N arena=B perm=N
+        lend=N mtp=N free=B chunk=C (a card a line, at most four a second): where that card is in the prompt right now -
+        the layers it has run, the chunk it is on, the tokens done of the prompt - and the loan it holds.  The Monitor's
+        Prefill and Loan tabs read `age` to fade a row from a finished prompt (the engine stops printing them then)."""
+        row = {}
+        for kv in line.split()[1:]:
+            k, _, v = kv.partition("=")
+            row[k] = int(v) if v.lstrip("-").isdigit() else v
+        if "dev" in row:
+            row["time"] = time.time()
+            with self._routes_lock:                     # (the same lock the request routes use: a cheap mutex)
+                self.live_prog[row["dev"]] = row
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -1755,9 +1773,21 @@ class Service:
         reported = getattr(self.engine, "lend", None)
         if reported:
             lend = [reported[k] for k in sorted(reported)]
+        # where each card is right now (LIVE lines): the stage (prompt / tail / decode), the layer it last ran, the
+        # chunk (k of nk), the tokens done of the prompt (p0 + T against total), and the loan it holds; `age` says how
+        # long ago the line came, so the page can fade a row from a prompt that has finished (the engine stops printing)
+        live_prog = None
+        with getattr(self.engine, "_routes_lock", threading.Lock()):
+            rows = [dict(r) for r in getattr(self.engine, "live_prog", {}).values()]
+        if rows:
+            live_prog = []
+            for row in sorted(rows, key=lambda r: r.get("dev", 0)):
+                row["age"] = round(now - row.pop("time", now), 2)
+                live_prog.append(row)
         hw = dict(tel["now"])
         cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
-        return {"engine": engine, "live": live, "tiers": tiers, "lend": lend, "gpu_map": self._gpu_map(cards),
+        return {"engine": engine, "live": live, "tiers": tiers, "lend": lend, "live_prog": live_prog,
+                "gpu_map": self._gpu_map(cards),
                 "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "hardware": hw,
                 "hardware_static":

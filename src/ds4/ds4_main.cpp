@@ -265,6 +265,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
 
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min) {
     std::vector<int> eos = parse_ids(eos_list);
+    m.set_live(true);   // (the Monitor's live per-device lines: layer, chunk, loan; never part of a request's stream)
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     std::printf("READY %lld stop\n", (long long) m.max_context());
     std::fflush(stdout);
