@@ -142,29 +142,37 @@ std::vector<int> cpu_list(const std::string& s) {   // "0-3,8,10-11"
     }
     return v;
 }
-// each NUMA node's physical cores (the first logical CPU of each core), in order
-std::vector<std::vector<int>> node_cores() {
+// each NUMA node's physical cores (the first logical CPU of each core), in order; `all` too, every logical CPU of
+// the node (its siblings included) - the list a pool reaches into when --cpu-threads asks for more than the cores
+std::vector<std::vector<int>> node_cores(std::vector<std::vector<int>>* all = nullptr) {
+    std::vector<std::vector<int>> nodes, every;
 #if defined(_WIN32)
-    std::vector<std::vector<int>> nodes = os::node_cores();
+    nodes = os::node_cores();
+    every = nodes;   // (the platform's view has no siblings to add)
 #else
-    std::vector<std::vector<int>> nodes;
     for (int n = 0; n < 64; ++n) {
         const std::string cl = read_file("/sys/devices/system/node/node" + std::to_string(n) + "/cpulist");
         if (cl.empty()) break;
+        const std::vector<int> cpus = cpu_list(cl);
         std::vector<int> cores;
-        for (int c : cpu_list(cl)) {
+        for (int c : cpus) {
             const std::vector<int> sib = cpu_list(
                 read_file("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list"));
             if (sib.empty() || sib[0] == c) cores.push_back(c);
         }
-        if (!cores.empty()) nodes.push_back(cores);
+        if (!cores.empty()) {
+            nodes.push_back(cores);
+            every.push_back(cpus);
+        }
     }
 #endif
     if (nodes.empty()) {
-        std::vector<int> all;
-        for (unsigned c = 0; c < std::max(1u, std::thread::hardware_concurrency() / 2); ++c) all.push_back((int) c);
-        nodes.push_back(all);
+        std::vector<int> only;
+        for (unsigned c = 0; c < std::max(1u, std::thread::hardware_concurrency() / 2); ++c) only.push_back((int) c);
+        nodes.push_back(only);
+        every.assign(1, only);
     }
+    if (all) *all = every;
     return nodes;
 }
 // anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages
@@ -1065,6 +1073,7 @@ struct Model::Impl {
     std::vector<float> freqs_win, freqs_comp;
     std::vector<std::unique_ptr<Pool>> pools;   // one per NUMA node, its workers on that node's cores
     std::vector<std::vector<int>> cores;        // each node's physical cores
+    std::vector<std::vector<int>> all_cpus;     // each node's logical CPUs (the siblings too)
     int NH = 1;                                 // the CPU lane's parts of an expert (the NUMA nodes)
     // the CPU lane's experts read in place from the model's files (one part, the files' layout; the page cache keeps
     // what fits) instead of copied into RAM, and how much of them the load reads ahead (the most-routed first)
@@ -2812,7 +2821,7 @@ struct Model::Impl {
         }
         // the CPU lane: one pool of workers per NUMA node, each expert split in NH column parts (part X on node X); in
         // place, one part (the files' layout) and one pool over every node's cores (the pages lie where the cache put them)
-        cores = node_cores();
+        cores = node_cores(&all_cpus);
         NH = file_experts ? 1 : (int) std::min<size_t>(2, cores.size());
         if (NH > 1 && ((g.ff / NH) % 128 != 0 || (g.dim / NH) % 128 != 0)) NH = 1;
         if (!pk.gguf) make_pools();   // (a GGUF's after its experts: copy_experts decides NH)
@@ -5044,22 +5053,45 @@ struct Model::Impl {
         return n + 1;
     }
     // the CPU lane's workers: a pool per NUMA node (NH of them) on its cores; in place with one part, one pool over
-    // every node's cores (the pages lie where the cache put them)
+    // every node's cores (the pages lie where the cache put them).  The physical cores pin first, exactly as before;
+    // the logical siblings follow, round-robin over the nodes, so --cpu-threads past the physical cores puts the
+    // extra workers on SMT threads instead of clipping the pool
     void make_pools() {
-        std::vector<std::vector<int>> cs = cores;
+        std::vector<std::vector<int>> cs = cores, as = all_cpus;
+        if (as.size() < cs.size()) as.resize(cs.size());
         if ((int) cs.size() < NH && !cs.empty()) {   // (DS4_COPY_NUMA=2 on one node, a test: its cores split in NH)
             std::vector<int> all = cs[0];
             cs.assign((size_t) NH, {});
             for (size_t i = 0; i < all.size(); ++i) cs[i * (size_t) NH / all.size()].push_back(all[i]);
+            as = cs;   // (the test's split has no sibling lists)
         }
         for (int X = 0; X < (int) cs.size() && X < std::max(NH, 1); ++X) {
             std::vector<int> c = cs[(size_t) X];
             if (file_experts && NH == 1)
                 for (size_t Y = 1; Y < cs.size(); ++Y) c.insert(c.end(), cs[Y].begin(), cs[Y].end());
+            const int host_core = X == 0 && !c.empty() ? c.front() : -1;
             if (X == 0 && !c.empty()) c.erase(c.begin());   // the host thread's core (it helps node 0's pool)
+            std::vector<int> list = c;
+            auto add = [&](int q) {
+                if (q != host_core && std::find(list.begin(), list.end(), q) == list.end()) list.push_back(q);
+            };
+            if (file_experts && NH == 1) {   // (the one pool: the nodes' siblings alternate)
+                for (size_t i = 0;; ++i) {
+                    bool more = false;
+                    for (size_t Y = 0; Y < as.size(); ++Y)
+                        if (i < as[Y].size()) {
+                            add(as[Y][i]);
+                            more = true;
+                        }
+                    if (!more) break;
+                }
+            } else if ((size_t) X < as.size()) {
+                for (int q : as[(size_t) X]) add(q);
+            }
             int nw = (int) c.size();
-            if (o.cpu_threads > 0) nw = std::max(X == 0 ? 0 : 1, std::min(nw, o.cpu_threads / NH - (X == 0 ? 1 : 0)));
-            pools.push_back(std::make_unique<Pool>(nw, c, 20000));   // spin through a token's layers (20 ms)
+            if (o.cpu_threads > 0)
+                nw = std::max(X == 0 ? 0 : 1, std::min((int) list.size(), o.cpu_threads / NH - (X == 0 ? 1 : 0)));
+            pools.push_back(std::make_unique<Pool>(nw, list, 20000));   // spin through a token's layers (20 ms)
         }
         (void) gg::mx_tier();   // (measured here, not on the first token)
         if (o.verbose) {
