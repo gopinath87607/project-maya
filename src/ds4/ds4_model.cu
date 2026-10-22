@@ -973,6 +973,23 @@ struct Model::Impl {
     bool ep_alloc = false;                     // the staging and the shares' maps exist
     bool ep_run = false;                       // this prompt runs expert-parallel
     unsigned ep_base = 0, ep_n = 0;            // the run's flag sequence base (a prompt apart from every other)
+    // DS4_PASS_LEND: a pair of layers whose banks are one block (place_experts: an encoder layer's and a decoder-tail
+    // layer's, on one device, the tail's above the encoder's), and the layers a prompt's passes have borrowed from or
+    // for, with the decode addressing pl_restore puts back
+    struct PlPair {
+        int enc = -1, tail = -1;
+        uint8_t* base = nullptr;               // the block: enc's bank at base, the tail's at base + tail_off
+        size_t tail_off = 0;
+        int n_enc = 0, n_tail = 0;             // (the block's slots for each side, its own expert bytes apart)
+        int ne = 0, nt = 0;                    // (the two banks the decoder keeps)
+    };
+    std::vector<PlPair> pl_pairs;
+    struct PlSaved {
+        int il = -1;
+        uint8_t* vram_base = nullptr;
+        int n_perm = 0;
+    };
+    std::vector<PlSaved> pl_saved;             // (the borrows in force: emptied when they are put back)
     size_t eg_cap = kWin;             // tokens h_eg holds
     int tap_cap = kWin;               // rows h_taps holds (a chunk seeds the drafter with its last 128)
     bool logits_all = false;          // the last feed was a chunk with logits for every row (chunk_logits)
@@ -1495,6 +1512,13 @@ struct Model::Impl {
     bool ep_on() const {   // allocate its staging (DS4_EP_ALLOC: the check's arm that keeps the placement equal)
         if (ep_do()) return true;
         const char* e = std::getenv("DS4_EP_ALLOC");
+        return e != nullptr && std::atoi(e) != 0;
+    }
+    // DS4_PASS_LEND=1: the prompt's two passes lend each other's expert banks (see pl_borrow).  Off by default, and
+    // only under DS4_TAIL_PREFILL: the banks of a decoder-tail layer and of an encoder layer on the same device are
+    // allocated as one block when the model loads, so either layer can use the whole block in the pass it runs
+    static bool pl_do() {
+        const char* e = std::getenv("DS4_PASS_LEND");
         return e != nullptr && std::atoi(e) != 0;
     }
     // --row-split-prefill, or DS4_ROW_SPLIT=1 (the checks): every device holds the same layer group and runs its own
@@ -2420,6 +2444,19 @@ struct Model::Impl {
                 for (size_t gi = 0; gi < n.size() && gi < groups.size(); ++gi)
                     for (int j = 0; j < n[gi] && il < g.nl; ++j) L[(size_t) il++].grp = (int) gi;
                 for (; il < g.nl; ++il) L[(size_t) il].grp = (int) groups.size() - 1;
+            }
+            // DS4_SPLIT_TAIL=a,b,..: the decoder-tail layers (candidate source + 1 .. the last) each group takes, on top
+            // of DS4_SPLIT's encoder range - the tail pass then runs on every group instead of the last one alone
+            if (const char* sp = std::getenv("DS4_SPLIT_TAIL")) {
+                std::vector<int> n;
+                for (const char* q = sp; *q;) {
+                    n.push_back(std::atoi(q));
+                    while (*q && *q != ',') ++q;
+                    if (*q == ',') ++q;
+                }
+                int il = g.cand_src >= 0 ? g.cand_src + 1 : g.nl;
+                for (size_t gi = 0; gi < n.size() && gi < groups.size(); ++gi)
+                    for (int j = 0; j < n[gi] && il < g.nl; ++j) L[(size_t) il++].grp = (int) gi;
             }
             // (the row split: the drafter's blocks ride with the head - the last chunk's taps and the head step are one
             // device's work there, which is what rp_static asks for; the blocks are small, the split's balance holds)
@@ -4293,6 +4330,51 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: Windows' commit has room for the GPU's experts (%.1f GB beside %.0f GB for the other "
                                  "programs)\n", room0 / 1e9, commit_margin() / 1e9);
         }
+        // DS4_PASS_LEND: an encoder layer's bank and a decoder-tail layer's on one device as ONE block, the tail's above
+        // the encoder's, so the encoder layer's slot numbering runs on into the tail's bank - a prompt's pass 1 gives the
+        // encoder layer the whole block, pass 2 the tail (pl_borrow).  The same slots and bytes as the plain way below;
+        // nothing changes when the flag is off
+        pl_pairs.clear();
+        std::vector<int> pl_block_of(L.size(), -1);   // layer -> its block in pl_pairs (-1: a bank of its own)
+        if (pl_do() && o.expert_lend && o.expert_cache) {
+            for (size_t di = 0; di < devs.size(); ++di) {
+                std::vector<int> enc, tail;
+                for (const Layer& l : L) {
+                    if (l.mtp || l.nm != 1 || l.dev != (int) di || l.lay.fmt != gg::kFmtMXFP4 || !lane_file(l)) continue;
+                    if (l.n_vram <= 0 || l.n_vram >= l.n_exp) continue;
+                    (l.il <= g.cand_src ? enc : tail).push_back(l.il);
+                }
+                for (size_t i = 0; i < enc.size() && i < tail.size(); ++i) {
+                    const Layer& e = L[(size_t) enc[i]];
+                    const Layer& t = L[(size_t) tail[i]];
+                    const int ne = std::min(e.n_vram, e.n_exp), nt = std::min(t.n_vram, t.n_exp);
+                    // (each expert's blob is its layer's own: the two banks sit one above the other, the tail's at the
+                    // next 256 bytes after the encoder's - a borrow takes the block's whole length in the borrower's unit)
+                    const size_t ue = unit(e), ut = unit(t);
+                    const size_t off_t = align256((size_t) ne * ue), blk = off_t + (size_t) nt * ut;
+                    const int n_e = std::min(e.n_exp, (int) (blk / ue)), n_t = std::min(t.n_exp, (int) (blk / ut));
+                    if (n_e <= ne || n_t <= nt) continue;   // (no room lent: the plain banks below)
+                    Dev& d = devs[di];
+                    cudaSetDevice(d.id);
+                    void* v = nullptr;
+                    if (cudaMalloc(&v, blk) != cudaSuccess) continue;   // (the plain banks below)
+                    d.allocs.push_back(v);
+                    d.experts += blk;
+                    pl_block_of[(size_t) enc[i]] = pl_block_of[(size_t) tail[i]] = (int) pl_pairs.size();
+                    pl_pairs.push_back({enc[i], tail[i], (uint8_t*) v, off_t, n_e, n_t, ne, nt});
+                }
+            }
+            if (!pl_pairs.empty() && o.verbose) {
+                size_t be = 0, bt = 0;
+                for (const PlPair& b : pl_pairs) {
+                    be += (size_t) b.ne * unit(L[(size_t) b.enc]);
+                    bt += (size_t) b.nt * unit(L[(size_t) b.tail]);
+                }
+                std::fprintf(stderr, "ds4 pass-lend: %zu bank pairs: %.1f GB of encoder banks, %.1f GB of tail banks "
+                                     "(each pass lends the one it does not run)\n",
+                             pl_pairs.size(), be / 1e9, bt / 1e9);
+            }
+        }
         for (Layer& l : L) {
             // the hottest experts of the profile first, then by index
             std::vector<int> order((size_t) l.n_exp);
@@ -4321,6 +4403,12 @@ struct Model::Impl {
                     Layer& x = member(l, m);
                     Dev& d = devs[(size_t) x.dev];
                     cudaSetDevice(d.id);
+                    const int bi = pl_block_of[(size_t) l.il];
+                    if (bi >= 0) {   // (the block it shares with its pair: place_experts' pass above, bytes and count)
+                        const PlPair& b = pl_pairs[(size_t) bi];
+                        x.vram_base = b.base + (l.il == b.tail ? b.tail_off : 0);
+                        continue;
+                    }
                     void* v = nullptr;
                     if (cudaMalloc(&v, (size_t) l.n_slots * unit(x)) != cudaSuccess) {
                         err = "cudaMalloc of layer " + std::to_string(l.il) + "'s " + std::to_string(l.n_slots) +
@@ -6197,6 +6285,141 @@ struct Model::Impl {
         if (o.verbose || filled > 0)
             std::fprintf(stderr, "ds4 lend: the decoder took the arena (%lld experts, %.1f GB, filled in %.0f ms)\n",
                          (long long) filled, bytes / 1e9, lend_ms);
+        return true;
+    }
+    // ---- DS4_PASS_LEND (see pl_do / pl_borrow): a layer's map emptied for its pair, its experts back to the CPU lane's
+    // source (the files) and its route table zeroed; the caller sets its addressing
+    bool pl_clear(Layer& l, std::string& err) {
+        for (int e = 0; e < l.n_exp; ++e) {
+            l.slot[(size_t) e] = -1;
+            l.hh[(size_t) e] = {nullptr, nullptr, nullptr, nullptr};
+            if (l.lay.fmt == gg::kFmtMXFP4) {   // (the file's mapping, as enter_prefill hands an evicted one back)
+                l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
+            } else if (file_experts) {
+                l.hh[(size_t) e] = {file_part(l, e), nullptr, nullptr, nullptr};
+                l.host[(size_t) e] = l.hh[(size_t) e][0];
+            } else {
+                l.host[(size_t) e] = nullptr;   // (no source to hand it back to: never lent)
+            }
+            if (!l.vm.empty()) l.vm[(size_t) e] = {};
+        }
+        l.n_slots = 0;
+        l.n_vram = 0;
+        l.spare_vram = -1;
+        Dev& d = devs[(size_t) l.dev];
+        cudaSetDevice(d.id);
+        std::vector<unsigned long long> tab((size_t) l.n_exp, 0ull);
+        CK(cudaMemcpyAsync(l.vram_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice, d.st));
+        CK(cudaStreamSynchronize(d.st));
+        return true;
+    }
+    // the borrower's free slots filled with its hottest non-resident experts - exit_prefill's way: the files' blobs read
+    // into the chunk staging by the readers a batch at a time, each DMA'd to its slot and the slot recorded after it
+    bool pl_fill(Layer& l, int64_t& filled, double& gb, std::string& err) {
+        if (l.n_slots <= 0) return true;
+        std::vector<char> used((size_t) l.n_slots, 0);
+        for (int e = 0; e < l.n_exp; ++e) {
+            const int s = l.slot[(size_t) e];
+            if (s >= 0 && s < l.n_slots) used[(size_t) s] = 1;
+        }
+        std::vector<int> frees;
+        for (int s = 0; s < l.n_slots; ++s)
+            if (!used[(size_t) s]) frees.push_back(s);
+        std::vector<int> cands;
+        for (int e = 0; e < l.n_exp; ++e)
+            if (l.slot[(size_t) e] < 0) cands.push_back(e);
+        std::stable_sort(cands.begin(), cands.end(),
+                         [&](int a, int b) { return l.heat[(size_t) a] > l.heat[(size_t) b]; });
+        const bool mx = l.lay.fmt == gg::kFmtMXFP4;
+        Chunk* cst = (size_t) l.dev < chunks.size() ? chunks[(size_t) l.dev].get() : nullptr;
+        uint8_t* stage = cst != nullptr && mx ? cst->stage : nullptr;
+        size_t nst = stage != nullptr && cst->readers != nullptr ? (size_t) cst->S : 0;
+        if (nst > 0 && unit(l) > cst->stage_stride) nst = 0;
+        const size_t batch = nst > 0 ? nst : 1;
+        const size_t nfill = std::min(frees.size(), cands.size());
+        Dev& d = devs[(size_t) l.dev];
+        for (size_t i0 = 0; i0 < nfill; i0 += batch) {
+            const size_t i1 = std::min(nfill, i0 + batch);
+            if (nst > 0) {   // (the readers: the files' reads, side by side, into the staging)
+                std::atomic<bool> bad{false};
+                cst->readers->run((int) (i1 - i0), [&](int i) {
+                    if (!read_mx(l, cands[i0 + (size_t) i], stage + (size_t) i * cst->stage_stride)) bad.store(true);
+                });
+                if (bad.load()) {
+                    err = "pass-lend: reading layer " + std::to_string(l.il) + "'s experts failed";
+                    return false;
+                }
+            }
+            cudaSetDevice(d.id);
+            for (size_t i = i0; i < i1; ++i)
+                if (!stream_expert(l, 0, cands[i], slot_ptr(l, frees[i]), copy_st[(size_t) l.dev], err,
+                                   nst > 0 ? stage + (i - i0) * cst->stage_stride : nullptr))
+                    return false;
+            CK(cudaStreamSynchronize(copy_st[(size_t) l.dev]));
+            for (size_t i = i0; i < i1; ++i) {   // (recorded after the copy: the staging serves the next batch)
+                const int e = cands[i], s = frees[i];
+                l.slot[(size_t) e] = s;
+                l.host[(size_t) e] = nullptr;
+                l.hh[(size_t) e] = {nullptr, nullptr, nullptr, nullptr};
+                set_vm(l, e, s);
+                ++filled;
+                gb += (double) unit(l) / 1e9;
+            }
+        }
+        std::vector<unsigned long long> tab((size_t) l.n_exp, 0ull);
+        for (int e = 0; e < l.n_exp; ++e)
+            if (l.slot[(size_t) e] >= 0) tab[(size_t) e] = (unsigned long long) slot_ptr(l, l.slot[(size_t) e]);
+        cudaSetDevice(d.id);
+        CK(cudaMemcpyAsync(l.vram_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice, d.st));
+        CK(cudaStreamSynchronize(d.st));
+        return true;
+    }
+    // one pass's borrow over the pairs.  Stage 0: each encoder layer takes its tail layer's bank (its own residents stay;
+    // the block's other slots are filled); stage 1: each tail layer takes the whole block - its own bank, which pass 1
+    // had filled with the encoder layer's experts, and the encoder layer's.  The lender's map is emptied and its slots
+    // count 0; the pair's decode addressing is saved the first time and put back by pl_restore
+    bool pl_borrow(int stage, std::string& err) {
+        if (pl_pairs.empty()) return true;
+        const double t0 = now_ms();
+        int64_t filled = 0;
+        double gb = 0;
+        if (pl_saved.empty())   // (their decode addressing, put back by pl_restore)
+            for (const PlPair& pr : pl_pairs) {
+                pl_saved.push_back({pr.enc, L[(size_t) pr.enc].vram_base, L[(size_t) pr.enc].n_perm});
+                pl_saved.push_back({pr.tail, L[(size_t) pr.tail].vram_base, L[(size_t) pr.tail].n_perm});
+            }
+        for (const PlPair& pr : pl_pairs) {
+            Layer& e = L[(size_t) pr.enc];
+            Layer& t = L[(size_t) pr.tail];
+            Layer& to = stage == 0 ? e : t;
+            Layer& from = stage == 0 ? t : e;
+            if (!pl_clear(from, err)) return false;   // (its slot count 0: the borrower takes the block)
+            from.n_perm = 0;
+            to.vram_base = pr.base;   // (the encoder layer's already: the block starts at its bank)
+            to.n_perm = stage == 0 ? pr.n_enc : pr.n_tail;
+            to.n_slots = to.n_perm;
+            to.n_vram = to.n_perm;
+            to.spare_vram = -1;
+            if (!pl_fill(to, filled, gb, err)) return false;
+        }
+        if (o.verbose || filled > 0)
+            std::fprintf(stderr, "ds4 pass-lend: pass %d, the %s banks lent to the %s: %lld experts, %.1f GB, filled in %.0f ms\n",
+                         stage + 1, stage == 0 ? "tail's" : "encoder's", stage == 0 ? "encoder layers" : "tail",
+                         (long long) filled, gb, now_ms() - t0);
+        return true;
+    }
+    // the borrows put back: every layer in play cleared (its experts to the files) with its decode addressing; the
+    // refill after the prompt (exit_prefill) fills both sides of every pair again from the profile
+    bool pl_restore(std::string& err) {
+        for (const PlSaved& s : pl_saved) {
+            Layer& l = L[(size_t) s.il];
+            l.vram_base = s.vram_base;
+            l.n_perm = s.n_perm;
+            if (!pl_clear(l, err)) return false;
+        }
+        if (!pl_saved.empty() && o.verbose)
+            std::fprintf(stderr, "ds4 pass-lend: the decoder's layout put back\n");
+        pl_saved.clear();
         return true;
     }
     bool ensure_decode(std::string& err) {
@@ -9556,6 +9779,21 @@ struct Model::Impl {
             Impl* p;
             ~EpEnd() { p->ep_run = false; }
         } ep_end_{this};
+        // DS4_PASS_LEND: pass 1's borrow - the decoder tail's banks to the encoder layers (pl_borrow); the plan below is
+        // the borrowed one, and every way out of the prompt puts the decoder's addressing back before exit_prefill
+        struct PlEnd {
+            Impl* p;
+            bool on = false;
+            ~PlEnd() {
+                if (!on) return;
+                std::string e2;
+                p->pl_restore(e2);
+            }
+        } pl_end_{this};
+        if (pl_do() && tail_on && !ep_run && !pl_pairs.empty()) {
+            pl_end_.on = true;
+            if (!pl_borrow(0, err)) return false;
+        }
         plan_streams();
         if (snap_slot >= 0) {   // feed_mark: the state before the run's last row, kept by its layers on the way
             for (Run& r : runs) r.snap_pos = pos + n - 1;
@@ -9654,6 +9892,10 @@ struct Model::Impl {
                 CK(cudaStreamSynchronize(dv.st));
             }
             if (!tail_sync_src(pos + n, err)) return false;
+            if (pl_end_.on) {   // DS4_PASS_LEND: pass 2's borrow - the encoder layers' banks to the tail
+                if (!pl_borrow(1, err)) return false;
+                plan_streams();
+            }
             if (!run_pass(truns, head_dev, false)) return false;
         }
         st.layer_ms += now_ms() - tl;
@@ -9722,6 +9964,10 @@ struct Model::Impl {
         if (logits_all) n_logits = (T_last - 1) % kWin + 1;   // (sample() takes the last row of d.logits)
         pos += n;
         st.tokens += n;
+        if (pl_end_.on) {   // (the decode layout back: exit_prefill fills both sides of every pair again)
+            pl_end_.on = false;
+            if (!pl_restore(err)) return false;
+        }
         if (!exit_prefill(err)) return false;   // (the decoder's experts back into the arena, the hottest first)
         cache_tick(n);
         int tap_n = T_last;   // the drafter's seed: the last rows of every tapping group's last chunk (the shortest one:

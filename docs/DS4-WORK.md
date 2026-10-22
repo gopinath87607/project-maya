@@ -45,6 +45,7 @@ Environment-only knobs added with them (all off/unset in normal use):
 | Env | Default | What it does |
 |---|---|---|
 | `DS4_TAIL_PREFILL=1` | off | The decoder tail: layers after the candidate-source layer only attend over the last `tail_rows()` rows (2,560 here), so a prompt runs in two passes - layers 0-20 over every token, then 21-39 over the tail, seeded with layer 20's saved hidden rows and its KV/index cache |
+| `DS4_PASS_LEND=1` | off | Two-stage prefill lending: each encoder layer and each tail layer are paired on their device into one joint expert block at load, and each pass lends the idle side's banks to the pass that runs (stage 1 the tail's banks to the encoders, stage 2 the encoders' banks to the tail). Needs `DS4_TAIL_PREFILL=1`; see section 8 for the A/B |
 | `DS4_EP_ALLOC=1` | off | Allocate EP's staging/shares without running the path (the check that keeps placement equal between the two arms) |
 | `DS4_EP_SELF=1` | off | Check arm: the owner keeps every expert and the partners none, so the expert arithmetic is the non-EP one |
 | `DS4_EP_STATS=1` | off | Per-layer share/read lines for EP |
@@ -301,3 +302,58 @@ server protocol, and every pre-existing flag and config key (`--expert-profile`,
 `--vram-experts`, `--cpu-threads`, `--prefill-chunk`, `--tp`, `--threads`, `--dspark*`, `--vision`,
 `--mmap-experts`, `DS4_SPLIT`, `DS4_FLOW`, `DS4_FLOW_STATS`, `DS4_PROF`, `DS4_SPEC_Q`, `DS4_READAHEAD_MB`,
 `DS4_RING_MB`, `DS4_READERS`).
+
+---
+
+## 8. The two-stage prefill lend (`DS4_PASS_LEND`) and the chunk ceiling
+
+### 8.1 The joint bank blocks
+
+A pass can only lend what it does not run: the encoder pass (layers 0-20) leaves the 19 tail layers' banks idle,
+and the tail pass leaves the encoders' banks idle. `DS4_PASS_LEND=1` (off by default) pairs one encoder layer and
+one tail layer on the same device at load and cudaMallocs ONE block: the encoder bank at `base`, the tail bank at
+`base + align256(ne*ue)`, with `n_e = min(n_exp, blk/ue)` and `n_t = min(n_exp, blk/ut)`. A pass swaps the pair's
+`vram_base`/`n_perm` so the borrower owns the whole block (one contiguous bank - `run_set` addresses residents as
+`vram_base + slot*unit`, so a second, disjoint bank would break every call site), fills the free slots from the
+files by heat, and clears the lender's map. `pl_restore` puts the decode addressing back before `exit_prefill`
+refills both sides.
+
+On the test split (encoders 5,5,5,6 / tail 5,5,5,4, gpu [2,0,1,3]): 19 bank pairs = 8.2 GB of encoder banks +
+9.5 GB of tail banks. Stage 1 fills 9.7 GB (727 experts) in 1.4 s; stage 2 fills 17.6 GB (1,106 experts) in 9.1 s.
+
+### 8.2 Results, 116,228-token prompt (same file, fresh restarts)
+
+| | pass-lend off | pass-lend on |
+|---|---|---|
+| prompt | **189,014 ms - 614.9 tok/s** | 219,564 ms - 529.4 tok/s |
+| experts streamed per card | 852 / 727 / 753 / 738 | 816 / 633 / 652 / 664 |
+| per-card prompt time | 187,381 ms | 196,223 ms |
+| exit refill for decode | 608 experts, 9.4 GB, 1.6 s | 1,785 experts, 26.6 GB, 21.8 s |
+
++30.6 s against the same split without it: 10.5 s of stage fills, 20.2 s of extra exit refill (restoring the
+layout clears both maps, so `exit_prefill` re-uploads 26.6 GB instead of the 9.4 GB delta), and the prompt proper
+8.8 s slower per card even though it streamed fewer experts. Stage 2 is a byte-wash for the 2,560-row tail pass;
+on a 3,068-token prompt the whole request took 63.3 s, stage 2's fill 14.2 s of it. **Status: off - measured, not
+a win.** A cheaper variant would keep the lenders' decode maps across the prompt so the exit refill is the delta
+again; not built.
+
+### 8.3 The chunk ceiling
+
+Arena cost per extra row (the carve formula; it reproduces the load's printed sizes to the MiB): CUDA0 0.247 GB,
+CUDA1 0.222, CUDA2 0.237, CUDA3 0.222 per 1,024 rows, paid 1:1 out of that card's expert slots.
+
+- **24,576 rows does not load**: `maya-ds4: cudaMalloc 5986 MiB (the prompt arena) on CUDA0 failed` - the 8 GB
+  card has ~4.8 GB left after dense weights. Hard ceiling ~18k rows on that card with every expert slot given up.
+- **16,384 rows loads** (arenas 4.38 / 4.07 / 4.21 / 4.04 GB), but the 5060s' trunk `perm` slots collapse
+  140/156 -> 4/37 (the lend slots are evicted at `enter_prefill`, so only `perm` serves a prompt), per-card prompt
+  218,947 ms, 238,937 ms total = 486.4 tok/s, and 3.2 / 1.1 / 0.9 / 2.7 GB of reads go unbuffered to the disk
+  where 8k read almost entirely through the page cache. That is +19.4 s against 8k with pass-lend and +50 s
+  against 8k without it.
+
+**Conclusion: 8,192 stays the chunk.** Bigger chunks buy fewer passes (15 -> 8 for 116k) but pay with the
+prompt's resident experts, and prompt residency is the faster lever on this machine.
+
+**Defaults note:** the live `maya-ds4.json` env is now empty (`DS4_SPLIT`, `DS4_TAIL_PREFILL`, `DS4_FLOW_STATS`,
+`DS4_PROF` removed); the launcher args (`--prefill-chunk-max 8192,8192,8192,8192`, `--reserve-pct 2,1,1,2`,
+`gpu [0,2,3,1]`) are unchanged. `maya-ds4.json` and `run-order-test.sh` are gitignored (`/maya-*.json`,
+`/run-*.sh`), so that reset lives on disk, not in this repo.
