@@ -985,10 +985,25 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu
                 ${_strata_mmq}/convert.cu)
+    # the mxfp4 instance's Blackwell product (native block-scaled FP4 MMA) is architecture-specific SASS: ptxas
+    # refuses it for sm_120 and takes it for sm_120a, so this library compiles the 12.0 entry as 120a-real (what
+    # llama.cpp's own build appends).  12.0 devices run it; the other targets and the rest of the project keep the
+    # configured list.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8" AND CMAKE_CUDA_ARCHITECTURES)
+      set(_strata_mmq_arches)
+      foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        if(_a MATCHES "^120(-real|-virtual)?$")
+          list(APPEND _strata_mmq_arches "120a-real")
+        else()
+          list(APPEND _strata_mmq_arches "${_a}")
+        endif()
+      endforeach()
+      set_target_properties(strata_mmq PROPERTIES CUDA_ARCHITECTURES "${_strata_mmq_arches}")
+    endif()
     if(_strata_mmq_glu)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_GLU=1)
     endif()
-    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)   # q8_0: the drafter's matrices (E-9); iq1_s, k-quants: GLM experts (docs/QUANT-PLAN.md)
+    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k mxfp4)   # q8_0: the drafter's matrices (E-9); iq1_s, k-quants: GLM experts (docs/QUANT-PLAN.md); mxfp4: maya-ds4's experts
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
     target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
@@ -998,6 +1013,12 @@ if(STRATA_NATIVE_EXPERTS)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
+    # maya-ds4's prompt path takes its MXFP4 experts through MMQ too (--chunk-mmq; src/ds4/ds4_mmq.cu)
+    if(TARGET maya-ds4)
+      target_sources(maya-ds4 PRIVATE src/ds4/ds4_mmq.cu)
+      target_link_libraries(maya-ds4 PRIVATE strata_mmq)
+      target_compile_definitions(maya-ds4 PRIVATE STRATA_DS4_MMQ=1)
+    endif()
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
     # the GLM fast path's prompt path (src/core/glm_prefill.cu) multiplies its experts with MMQ too

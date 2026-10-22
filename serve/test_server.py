@@ -997,6 +997,34 @@ class LiveRate(unittest.TestCase):
             httpd.server_close()
 
 
+class RowSplitLive(unittest.TestCase):
+    """The row-split prefill's LIVE rows: a card a line, with the mode's own keys (path=rowsplit, grp/ngrp, wait,
+    chunk_rows).  The server keeps every key as it comes - the Monitor's wavefront reads them - and a flow line keeps
+    parsing as before (no key renamed, nothing added to it)."""
+
+    def rows(self, *lines):
+        eng = StrataEngine.__new__(StrataEngine)
+        eng.live_prog = {}
+        eng._routes_lock = threading.Lock()
+        for line in lines:
+            eng._parse_live(line)
+        return eng.live_prog
+
+    def test_the_modes_rows_keep_their_own_keys(self):
+        r = self.rows("LIVE dev=3 stage=prompt path=rowsplit layer=13 k=0 nk=1 p0=12288 T=4096 done=16384 total=16384 "
+                      "arena=1024 perm=200 lend=0 mtp=0 free=5000 chunk=8192 grp=1 ngrp=4 wait=1 chunk_rows=4096")[3]
+        self.assertEqual((r["path"], r["grp"], r["ngrp"], r["wait"], r["chunk_rows"]), ("rowsplit", 1, 4, 1, 4096))
+        self.assertEqual((r["layer"], r["p0"], r["T"]), (13, 12288, 4096))
+        self.assertIn("time", r)                      # (metrics() turns it into `age`, the page's freshness key)
+
+    def test_the_flow_rows_are_untouched(self):
+        r = self.rows("LIVE dev=0 stage=prompt path=flow layer=7 k=0 nk=1 p0=0 T=1024 done=1024 total=16384 "
+                      "arena=1024 perm=200 lend=0 mtp=0 free=5000 chunk=8192")[0]
+        self.assertEqual((r["path"], r["layer"], r["chunk"]), ("flow", 7, 8192))
+        for k in ("grp", "ngrp", "wait", "chunk_rows"):
+            self.assertNotIn(k, r)
+
+
 class SharedSettings(unittest.TestCase):
     """The web app's "Use for other apps too": POST /settings makes its Chat settings every client's defaults."""
 

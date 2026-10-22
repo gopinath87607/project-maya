@@ -67,7 +67,7 @@ std::vector<int> parse_ids(const std::string& s) {
 void usage() {
     std::fprintf(stderr,
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N] [--reserve-pct P0,P1,...]\n"
-                 "           [--no-expert-lend] [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
+                 "           [--no-expert-lend] [--ep-prefill] [--row-split-prefill] [--chunk-mmq] [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--prefill-chunk-max N0,N1,...]\n"
                  "           [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto] [--ram-resident]\n"
@@ -454,7 +454,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::snprintf(b, sizeof b, " phase=%lld lend_n=%lld lend_gb=%.2f lend_ms=%.0f", (long long) s.phase,
                           (long long) s.lend_n, s.lend_gb, s.lend_ms);
             out += b;
-            if (s.path >= 0) out += s.path != 0 ? " path=flow" : " path=windows";
+            if (s.path >= 0) out += s.path == 2 ? " path=rowsplit" : s.path != 0 ? " path=flow" : " path=windows";
             // the drafter and its verification, a token; the n-gram memory's rows a token, the share of them its cache
             // served, and the rows it holds
             const double eg_rows = (double) (s.eg_rows - s_dec.eg_rows);
@@ -561,6 +561,9 @@ int main(int argc, char** argv) {
         }
         else if (a == "--reserve-pct") o.reserve_pct = parse_ids(val("--reserve-pct"));
         else if (a == "--no-expert-lend") o.expert_lend = false;
+        else if (a == "--ep-prefill") o.ep_prefill = true;
+        else if (a == "--row-split-prefill") o.row_split_prefill = true;
+        else if (a == "--chunk-mmq") o.chunk_mmq = true;
         else if (a == "--vram-experts") o.vram_experts = std::atof(val("--vram-experts").c_str());
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val("--cpu-threads").c_str());
         else if (a == "--expert-profile") o.profile = val("--expert-profile");

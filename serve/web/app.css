@@ -539,10 +539,10 @@ body:not([data-tab="chat"]) .chats__search, body:not([data-tab="chat"]) .chats__
 /* a card's bar: a part a hue (the same hues the GPU map's bars use), the widths the bytes; free stays the bare track */
 .mibbar { display: flex; height: 18px; gap: 2px; border-radius: 6px; overflow: hidden; background: var(--st-surface-3); }
 /* the hues, shared by the bars and the key that names them (mibLegend renders .miblegend) */
-.mibbar, .miblegend { --mb-weights: #2a78d6; --mb-pool: var(--st-accent); --mb-lend: #1baf7a; --mb-mtp: #e87ba4;
+.mibbar, .miblegend, .prefill-wave { --mb-weights: #2a78d6; --mb-pool: var(--st-accent); --mb-lend: #1baf7a; --mb-mtp: #e87ba4;
                       --mb-prompt: #eda100; --mb-spare: color-mix(in srgb, var(--st-ink-muted) 30%, var(--st-surface-3));
                       --mb-free: transparent; }
-[data-theme="dark"] .mibbar, [data-theme="dark"] .miblegend {
+[data-theme="dark"] .mibbar, [data-theme="dark"] .miblegend, [data-theme="dark"] .prefill-wave {
   --mb-weights: #3987e5; --mb-lend: #199e70; --mb-mtp: #d55181; --mb-prompt: #c98500; }
 .mibbar__seg { display: block; height: 100%; min-width: 2px; flex: 0 1 0; border-radius: 3px;
                background: var(--mb-free); transition: flex-grow 400ms var(--st-ease); }
@@ -566,11 +566,38 @@ body:not([data-tab="chat"]) .chats__search, body:not([data-tab="chat"]) .chats__
 .miblegend .dot { background: var(--mb-c); flex: none; }
 .miblegend .dot--free { background: transparent; box-shadow: inset 0 0 0 1.5px var(--st-ink-muted); }
 
+/* the row-split prefill's wavefront: a strip a card, a cell a trunk layer - filled run, ringed on it, hatched held */
+.prefill-wave { display: flex; flex-direction: column; gap: var(--st-s-2); }
+.wave-head { display: flex; align-items: baseline; gap: var(--st-s-3); flex-wrap: wrap; }
+.wave-head__title { font-size: var(--st-fs-sm); }
+.wave-rows { display: flex; flex-direction: column; gap: 3px; }
+.wave-row { display: grid; grid-template-columns: 150px minmax(0, 1fr) 170px; align-items: center;
+            column-gap: var(--st-s-3); }
+.wave-row__name { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
+.wave-row__name b { font-size: var(--st-fs-sm); font-weight: 650; }
+.wave-row__name span, .wave-row__state { font-size: var(--st-fs-xs); color: var(--st-ink-muted);
+                                         font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden;
+                                         text-overflow: ellipsis; }
+.wave-cells { display: grid; grid-template-columns: repeat(var(--n, 40), minmax(0, 1fr)); gap: 2px; }
+.wave-cell { display: block; height: 16px; border-radius: 3px; background: var(--st-surface-3); }
+.wave-cell--edge { margin-left: 4px; }   /* a group boundary: the trunk's layers cut into the mode's groups */
+.wave-cell[data-st="done"] { background: var(--mb-prompt); }
+.wave-cell[data-st="now"] { background: var(--mb-prompt);
+                            box-shadow: 0 0 0 2px var(--st-surface), 0 0 0 3.5px var(--st-ink); }
+.wave-cell[data-st="held"] { background: repeating-linear-gradient(135deg,
+  var(--mb-prompt) 0 3px, color-mix(in srgb, var(--mb-prompt) 30%, var(--st-surface-3)) 3px 6px); }
+.wave-key { display: flex; flex-wrap: wrap; gap: var(--st-s-2) var(--st-s-4); align-items: center;
+            font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.wave-key__item { display: inline-flex; align-items: center; gap: 6px; }
+.wave-key__item .wave-cell { width: 16px; height: 12px; }
+
 @media (max-width: 760px) {
   .gpu-line, .lend-row { grid-template-columns: minmax(0, 1fr) auto; }
   .gpu-line .mibbar, .lend-row .mibbar { grid-column: 1 / -1; }
   .lend-rows, .gpus-list { gap: var(--st-s-4); }
   .miblegend { grid-template-columns: minmax(0, 1fr); gap: var(--st-s-2); }
+  .wave-row { grid-template-columns: minmax(0, 1fr); row-gap: 3px; }
+  .wave-row__state { display: none; }
 }
 
 /* the live number each view carries in its tab (the engine's own facts, summed) */

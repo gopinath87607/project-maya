@@ -97,6 +97,7 @@ bool supported(int t) {
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
         case GGML_TYPE_IQ1_S:  // GLM-5.3-Flash's IQ1_S experts
         case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
+        case GGML_TYPE_MXFP4:  // maya-ds4's experts (Ampere: q8_1 activations, Blackwell: native FP4)
             return true;   // (the Maya quants' candidates, docs/QUANT-PLAN.md; IQ1_M has no MMQ)
         default:
             return false;
@@ -113,10 +114,30 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
 
 size_t q8_block_bytes() { return sizeof(block_q8_1_mmq); }
 
+bool act_fp4(int t) {
+    // (llama.cpp's host path: blackwell_mma_available(cc) && MXFP4 -> the native FP4 product, its activations in
+    // block_fp4_mmq rather than q8_1)
+    if ((ggml_type) t != GGML_TYPE_MXFP4) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    return blackwell_mma_available(ggml_cuda_info().devices[dev].cc);
+}
+
+size_t act_bytes(int t, int64_t rows, int64_t cols) {
+    if (!act_fp4(t)) return q8_bytes(rows, cols);
+    return (size_t) rows * (size_t) pad512(cols) * sizeof(block_fp4_mmq) / QK_FP4_MMQ + 128 * sizeof(block_fp4_mmq);
+}
+
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
-    quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
-                           (cudaStream_t) stream);
+    if (act_fp4(t)) {
+        const bool aligned = ((uintptr_t) x % 32 == 0) && ((size_t) ld % 8 == 0);   // (32 bytes of floats, as ggml does)
+        quantize_mmq_fp4_cuda(x, ids, xq, nullptr, (ggml_type) t, aligned, cols, ld, rows * ld, rows * ld, pad512(cols),
+                              rows, 1, 1, (cudaStream_t) stream);
+    } else {
+        quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
+                               (cudaStream_t) stream);
+    }
     ck(cudaGetLastError(), "quantize");
 }
 
@@ -146,6 +167,7 @@ void dispatch(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s)
         case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
         case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
+        case GGML_TYPE_MXFP4: mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, a, s); break;
         default:
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) a.type_x);
             std::exit(1);

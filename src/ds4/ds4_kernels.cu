@@ -1519,6 +1519,11 @@ __global__ void wait_flags_kernel(const unsigned* flags, int n, int stride, unsi
     for (int i = 0; i < n; ++i) wait_at_least(flags + (size_t) i * stride, seq);
     __threadfence_system();
 }
+// a partner's partial output (host-mapped) added into the owner's acc, in place
+__global__ void ep_add_kernel(float* __restrict__ acc, const float* __restrict__ part, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x)
+        acc[i] += ld_fresh(part + i);
+}
 __global__ void set_flag_kernel(unsigned* flag, unsigned v) {
     __threadfence_system();
     *(volatile unsigned*) flag = v;
@@ -2045,6 +2050,11 @@ void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s)
 }
 void wait_flags(const unsigned* flags, int n, int stride, unsigned seq, cudaStream_t s) {
     if (n > 0) wait_flags_kernel<<<1, 32, 0, s>>>(flags, n, stride, seq);
+}
+void ep_add(float* acc, const float* host_part, int n, cudaStream_t s) {
+    if (n <= 0) return;
+    const int blocks = std::max(1, std::min(4096, (n + kThreads - 1) / kThreads));
+    ep_add_kernel<<<blocks, kThreads, 0, s>>>(acc, host_part, n);
 }
 void set_flag(unsigned* flag, unsigned v, cudaStream_t s) { set_flag_kernel<<<1, 1, 0, s>>>(flag, v); }
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {

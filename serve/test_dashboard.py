@@ -134,6 +134,22 @@ class Dashboard(unittest.TestCase):
         s, _, b = self.req("GET", "/metrics")
         self.assertEqual(json.loads(b)["requests"][0]["api"], "openai")
 
+    def test_metrics_carry_the_row_splits_live_row(self):
+        # (the Prefill tab's wavefront reads these: path=rowsplit with the group, the wait and the card's own rows)
+        eng = self.engine
+        eng.live_prog = {3: {"dev": 3, "stage": "prompt", "path": "rowsplit", "layer": 13, "k": 0, "nk": 1,
+                             "p0": 12288, "T": 4096, "done": 16384, "total": 16384, "grp": 1, "ngrp": 4, "wait": 1,
+                             "chunk_rows": 4096, "time": time.time()}}
+        try:
+            s, _, b = self.req("GET", "/metrics")
+        finally:
+            del eng.live_prog
+        self.assertEqual(s, 200)
+        (row,) = json.loads(b)["live_prog"]
+        self.assertEqual((row["path"], row["grp"], row["ngrp"], row["wait"], row["chunk_rows"]),
+                         ("rowsplit", 1, 4, 1, 4096))
+        self.assertIn("age", row)                     # (the page fades a row older than 3 s: the prompt has ended)
+
 
 class ContextCost(unittest.TestCase):
     """The GLM engine's start lines give what its context costs in VRAM, summed over its GPUs."""

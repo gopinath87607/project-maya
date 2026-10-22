@@ -55,6 +55,17 @@ struct Options {
     std::vector<int> prefill_chunk_max;
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
+    // expert-parallel prefill: every GPU streams and computes a share of each layer's experts (split by index), the
+    // layer's owner summing the shares - a single-chunk encoder pass only; decode and the chunked path are untouched
+    bool ep_prefill = false;
+    // row-split prefill: every GPU holds the same layer group (as many layers as fit) and runs its own chunk of the
+    // prompt's rows through it, group by group - a second prefill path beside the chunked pipeline, both untouched
+    // when it is off (env DS4_ROW_SPLIT=1); the plan is automatic, the window 8192..ndev*chunk_max rows
+    bool row_split_prefill = false;
+    // the prompt path's routed experts through llama.cpp's MMQ kernels (int8 tensor cores on Ampere, the native FP4
+    // product on Blackwell) instead of the F32 GGUF kernels; the chunked prompt and the verify windows' sets only -
+    // decode is untouched (env DS4_MMQ=1 for the checks)
+    bool chunk_mmq = false;
     bool verbose = false;
 };
 
@@ -92,7 +103,8 @@ struct Stats {
     int64_t phase = 0;
     int64_t lend_n = 0;
     double lend_gb = 0.0, lend_ms = 0.0;
-    // the last prompt that chose between the chunk path (the flow) and windows: 1 the flow, 0 windows, -1 none yet
+    // the last prompt that chose between the chunk path (the flow) and windows: 1 the flow, 0 windows, 2 row-split,
+    // -1 none yet
     int64_t path = -1;
 };
 

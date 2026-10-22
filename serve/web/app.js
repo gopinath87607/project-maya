@@ -641,7 +641,17 @@ function renderLendPanel(m) {
 function renderPrefillPanel(m) {
   const card = $("prefill-card"), gs = bigFirst(m.lend || []), eng = m.engine || {}, stat = (m.tiers || {}).now || {};
   const live = m.live || {}, hist = (m.history || {}), last = (m.requests || [])[0], rows = liveRows(m);
+  // the row split's cards print a line as they enter a layer and after it, then nothing while they are held at the
+  // wavefront (or loading the next group): the table and the strip keep their last line of this prompt, marked waiting
+  const rpAll = ((m.live_prog) || []).filter((r) => r.path === "rowsplit");
+  const liveTotal = num(live.prompt_total);
+  const carried = live.state === "reading"
+    ? rpAll.filter((r) => num(r.age) != null && r.age > LIVE_FRESH_S &&
+                          (liveTotal == null || num(r.total) == null || Math.abs(num(r.total) - liveTotal) <= 1))
+            .map((r) => ({...r, stale: 1}))
+    : [];
   const byDev = new Map(rows.map((r) => [r.dev, r]));
+  for (const r of carried) if (!byDev.has(r.dev)) byDev.set(r.dev, r);
   const reading = live.state === "reading";
   // the pipeline's own order: layer 0's card first, whatever the cards' sizes (the GPU and Loan tabs keep big card first)
   const start = (g) => { const L = g.layers || []; return L.length ? L[0] : 1e9; };
@@ -667,10 +677,15 @@ function renderPrefillPanel(m) {
           : reading ? "reading now" : last ? "last request" : "waiting for a prompt");
   setCard("pf-chunk", eng.prefill_chunk ? fmt(eng.prefill_chunk) : (chunks[0] ? fmt(chunks[0].chunk) : null), " tokens",
           steps.length > 1 ? `steps ${steps.join(" → ")}` : "a chunk a pass");
-  const pathN = num(stat.path);   // STAT's path: 1 the chunked pass (the flow), 0 windows of 16
-  const path = pathN === 1 ? "flow" : pathN === 0 ? "windows" : null;
-  setCard("pf-path", path, "", path === "flow" ? "the chunked pass: each expert read once a layer, at once"
-                                  : path === "windows" ? "windows of 16 tokens" : "the engine picks it a prompt");
+  const pathN = num(stat.path);   // STAT's path: 2 the row-split pass, 1 the chunked pass (the flow), 0 windows of 16
+  // (the engine's own INFO too: with the row split loaded the method is the card's fact, not one prompt's path)
+  const rpOn = num(+eng.row_split) === 1;
+  const path = rpOn || pathN === 2 ? "row-split" : pathN === 1 ? "flow" : pathN === 0 ? "windows" : null;
+  setCard("pf-path", path, "", path === "row-split"
+                            ? (pathN === 2 ? "every card holds the same layer group; the prompt's rows split across the cards"
+                                           : "on — every card holds the same layer group; a prompt of 8,192 rows and up splits its rows across the cards")
+                            : path === "flow" ? "the chunked pass: each expert read once a layer, at once"
+                            : path === "windows" ? "windows of 16 tokens" : "the engine picks it a prompt");
   setCard("pf-prompt", last ? fmt(last.prompt_tokens) : (live.prompt_tokens != null ? fmt(live.prompt_tokens) : null),
           " tokens", last ? `${fmt(last.reused)} reused from the conversation` : "");
   spark("pf-rate-p", (hist.prefill_tok_s_mean || []).map((x) => x || 0));
@@ -679,7 +694,16 @@ function renderPrefillPanel(m) {
     if (!r) return "–";
     const l = num(r.layer), k = num(r.k), nk = num(r.nk), T = num(r.T), p0 = num(r.p0);
     const parts = [stageName(r)];
+    if (r.path === "rowsplit") {          // (the mode's own keys: which group the card holds, and its wait at the front)
+      const g = num(r.grp), ng = num(r.ngrp);
+      if (g != null && ng) parts.push(`g${fmt(g + 1)}/${fmt(ng)}`);
+      const rd = num(r.round), nrd = num(r.nround);
+      if (rd != null && nrd > 1) parts.push(`round ${fmt(rd)}/${fmt(nrd)}`);   // (a prompt over the caps runs in rounds)
+    }
     if (l != null && l >= 0) parts.push(`L${fmt(l)}`);
+    // (only the engine's own wait key means held: stale just means its last line is over 3 s old, and a layer at
+    // 8,192 rows takes ~7 s, so a busy card would otherwise read "waiting")
+    if (num(r.wait) === 1) parts.push("waiting");
     if (k != null && nk != null && nk > 1) parts.push(`chunk ${k + 1}/${nk}`);
     if (p0 != null && T != null) parts.push(`@${fmt(p0 + T)}`);
     return parts.filter(Boolean).join(" · ");
@@ -689,9 +713,11 @@ function renderPrefillPanel(m) {
     return !t ? "–" : `${fmt(100 * d / t)}%`;
   };
   const tailOn = rows.some((r) => r.stage === "tail");
+  const rw = [...byDev.values()].filter((r) => r.path === "rowsplit");   // (the row-split prefill's own rows: the wavefront below)
   const n = chunks.length || gs.length;
   $("prefill-sub").textContent = reading
-    ? `${n} GPU${n > 1 ? "s" : ""} reading now${tailOn ? " · the decoder tail" : ""}`
+    ? `${n} GPU${n > 1 ? "s" : ""} reading now${tailOn ? " · the decoder tail" : ""}${rw.length ? " · the row split" : ""}`
+    : rpOn ? `${n} GPU${n > 1 ? "s" : ""} · the row split${rw.length ? " · the last prompt" : " is on — waiting for a prompt"}`
     : `${n} GPU${n > 1 ? "s" : ""} · the last prompt's chunks`;
   // the pipeline's own order: the layer each card starts at, whatever the rows' size order
   const stage = (g) => {
@@ -706,12 +732,22 @@ function renderPrefillPanel(m) {
       <th class="num">Read</th></tr></thead><tbody>` +
     chunks.map((g) => {
       const r = byDev.get(g.dev);
+      // (the mode's live chunk_rows is the card's own cut of the prompt's rows - the LEND line's fixed cap otherwise;
+      // its layers are the group every card holds, not the pipeline's split)
+      const cr = r && r.path === "rowsplit" ? num(r.chunk_rows) : null;
+      const K = num(+eng.row_split_k) || 0, rpG = num(+eng.row_split_groups) || 0;
+      const rg = r && r.path === "rowsplit" ? num(r.grp) : null, rgn = r && r.path === "rowsplit" ? num(r.ngrp) : null;
+      // (the mode's own layers: every card holds the same group, not the pipeline's per-card range)
+      const lay = rg != null && rgn ? `every card · ${K ? `${fmt(K)} layers` : "one group"} · g${fmt(rg + 1)}/${fmt(rgn)}`
+                : rpOn ? `every card · ${K ? `${fmt(K)} layers a group` : "one group"}${rpG ? ` · ${fmt(rpG)} groups` : ""}`
+                : (layersOf(g, gs) || "–");
       return `<tr><td>GPU ${esc(cardLabel(m, g))}</td><td>${stage(g)}</td><td>${esc(gpuNameCls(gpuOf(m, g)) || "–")}</td>
-      <td>${layersOf(g, gs) || "–"}</td>
-      <td class="num">${fmt(g.chunk)} tokens</td>
+      <td>${esc(lay)}</td>
+      <td class="num">${cr != null ? `${fmt(cr)} rows` : `${fmt(g.chunk)} tokens`}</td>
       <td>${esc(nowCell(r))}</td><td class="num">${readCell(r)}</td></tr>`;
     }).join("") + `</tbody></table>` : "";
   mibLegend($("prefill-legend"), [{k: "prompt"}, {k: "lend"}, {k: "mtp"}]);
+  renderWavefront(m, rw);
   $("prefill-note").textContent = chunks.length
     ? "Rows follow the pipeline: a prompt walks the trunk blocks in layer order, from the card that owns layer 0 to " +
       "the one that owns the last layer, and Stage is the card's place in that order. Chunk is how many prompt tokens " +
@@ -720,8 +756,71 @@ function renderPrefillPanel(m) {
       "layer it last ran, its chunk of the pass, and the token position it reached; Read is how much of the pass it has " +
       "done. Bigger chunks read each expert once a prompt instead of twice, but take VRAM the expert banks would " +
       "otherwise hold. The colour key is those same bytes on the GPUs and Loan tabs: orange is these chunk buffers " +
-      "while a prompt is read; teal and pink are what the decoder swaps into the same bytes afterwards."
+      "while a prompt is read; teal and pink are what the decoder swaps into the same bytes afterwards." +
+      (rw.length || rpOn ? " The wavefront is the row-split prefill: every card holds the same group of layers and reads its own " +
+        "cut of the prompt's rows, a cell is a trunk layer — filled once that card has run it, ringed for the one it " +
+        "is on, hatched while it is held at the wavefront for the chunk in front of it. A prompt larger than the cards' " +
+        "chunk caps runs it in rounds (the round key), each one seeded from the round before." : "")
     : "";
+}
+
+// The row-split prefill's wavefront (the engine's LIVE rows with path=rowsplit): every card holds the same group of
+// the trunk's layers and reads its own cut of the prompt's rows; a card starts a layer once every chunk in front of
+// it has published that layer.  A strip a card, a cell a trunk layer: filled once that card has run it, ringed for the
+// layer it is on, hatched while it waits at the wavefront (the engine's wait key), bare while it is still to come.
+// The label is the card's own rows and group; nothing here is drawn unless a live row carries the path.
+function renderWavefront(m, rw) {
+  const wrap = $("prefill-wave");
+  if (!wrap) return;
+  const eng = m.engine || {};
+  const K = num(+eng.row_split_k) || 0, G = num(+eng.row_split_groups) || 0;
+  const on = num(+eng.row_split) === 1;   // (the method is loaded: its frame shows between prompts too)
+  if (!rw.length && !on) { wrap.hidden = true; return; }
+  let nl = num(+eng.row_split_layers) || (K && G ? K * G : 0);   // (the engine's count, else what the groups cover)
+  for (const r of rw) { const l = num(r.layer); if (l != null && l + 1 > nl) nl = l + 1; }
+  if (nl < 1) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  // the wavefront's own order: the chunk that starts first reads first, and publishes first; idle, the cards in order
+  const rows = rw.length
+    ? rw.slice().sort((a, b) => (num(a.p0) || 0) - (num(b.p0) || 0) || (num(a.dev) || 0) - (num(b.dev) || 0))
+    : (m.lend || []).map((g) => ({dev: g.dev, idle: 1})).sort((a, b) => (num(a.dev) || 0) - (num(b.dev) || 0));
+  const state = (r, i) => {
+    const g = num(r.grp), l = num(r.layer);
+    if (i < (g != null && K ? g * K : 0)) return "done";   // the groups before this one are behind the card
+    if (l == null || l < 0) return "todo";
+    if (i < l) return "done";
+    if (i === l) return num(r.wait) === 1 ? "held" : "now";
+    return "todo";
+  };
+  const gs = new Map((m.lend || []).map((g) => [g.dev, g]));
+  $("prefill-wave-sub").textContent = `${rows.length} card${rows.length > 1 ? "s" : ""}` +
+    (K && G ? ` · ${fmt(K)} layers a group, ${fmt(G)} groups` : "") + ` · ${fmt(nl)} trunk layers` +
+    (rw.length ? "" : " · idle — the next prompt of the mode's window runs here");
+  $("prefill-wave-rows").innerHTML = rows.map((r) => {
+    const g = gs.get(r.dev), T = num(r.chunk_rows), p0 = num(r.p0);
+    const range = r.idle ? "every card, the same group"
+                : p0 != null && T != null && T > 0 ? `rows ${fmt(p0)}–${fmt(p0 + T - 1)}`
+                : p0 != null ? `rows from ${fmt(p0)}` : "rows –";
+    const rg = num(r.grp), rgn = num(r.ngrp), l = num(r.layer), held = num(r.wait) === 1;
+    const rd = num(r.round), nrd = num(r.nround);
+    const st = r.idle ? "waiting for a prompt"
+      : [rg != null && rgn ? `group ${fmt(rg + 1)}/${fmt(rgn)}` : null,
+         rd != null && nrd > 1 ? `round ${fmt(rd)}/${fmt(nrd)}` : null,
+         l != null && l >= 0 ? (held ? `held at L${fmt(l)}` : `on L${fmt(l)}`) : null]
+        .filter(Boolean).join(" · ") || "–";
+    const name = `GPU ${g ? cardLabel(m, g) : r.dev}`;
+    const cells = [];
+    for (let i = 0; i < nl; ++i)
+      cells.push(`<i class="wave-cell${K && i > 0 && i % K === 0 ? " wave-cell--edge" : ""}" data-st="${state(r, i)}"></i>`);
+    return `<div class="wave-row">
+      <div class="wave-row__name"><b>${esc(name)}</b><span>${esc(range)}</span></div>
+      <div class="wave-cells" style="--n:${nl}" role="img" aria-label="${esc(`${name}, ${range}, ${st}`)}">${cells.join("")}</div>
+      <div class="wave-row__state">${esc(st)}</div>
+    </div>`;
+  }).join("");
+  $("prefill-wave-key").innerHTML =
+    [["done", "run"], ["now", "on it"], ["held", "waiting at the front"], ["todo", "to come"]]
+      .map(([k, t]) => `<span class="wave-key__item"><i class="wave-cell" data-st="${k}"></i>${esc(t)}</span>`).join("");
 }
 
 // Storage: the SSD reads a token costs, the drive the model lives on
