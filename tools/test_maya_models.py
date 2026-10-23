@@ -124,7 +124,7 @@ class RestartAfterUpdate(unittest.TestCase):
                            % ((d / "strata").as_posix(), (d / "tok").as_posix(), (d / "pack").as_posix()))
             a = SimpleNamespace(port=8090, host=None, api_key=None, gpu=None, gpus="0,1", backend="cuda")
             with patch.object(maya, "refresh_engine") as refresh, patch.object(maya, "say"), \
-                    patch.object(maya, "setup_screen", return_value=False),                     patch.object(maya.sys, "argv", list(argv)),                     patch.object(maya.subprocess, "call", return_value=rc) as call,                     patch.object(maya.os, "execv") as execv, patch.object(maya, "WIN", False):
+                    patch.object(maya, "setup_screen", return_value=False),                     patch.object(maya.sys, "argv", list(argv)),                     patch.object(maya, "run_server", return_value=rc) as call,                     patch.object(maya.os, "execv") as execv, patch.object(maya, "WIN", False):
                 out = maya.start(cfg, a)
             return out, call, execv, refresh
 
@@ -143,6 +143,13 @@ class RestartAfterUpdate(unittest.TestCase):
         out, _, execv, _ = self.start(0)
         self.assertEqual(out, 0)
         execv.assert_not_called()
+
+    def test_a_new_port_starts_again_on_the_saved_one(self):   # (the dashboard's Port: RESTART_EXIT)
+        _, _, execv, _ = self.start(maya.RESTART_EXIT)
+        argv = execv.call_args.args[1]
+        self.assertEqual(argv[1:3], [str(maya.HERE / "maya.py"), "--yes"])
+        self.assertNotIn("--port", argv)               # (this start's --port 8090 would undo it: the config's applies)
+        self.assertEqual(argv[argv.index("--gpus") + 1], "0,1")
 
 
 class RunScript(unittest.TestCase):

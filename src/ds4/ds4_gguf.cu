@@ -199,6 +199,71 @@ void q8_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, 
     q8_quant_kernel<<<grid, kThreads, 0, s>>>(x, ldx, k, q, d);
 }
 
+// ---- the low-bit experts' activations as the CPU lane rounds them (ggml's Q8_K, quantize_row_q8_K_ref, ggml-cpu's
+// on x86): per 256 values max = the signed value of the largest magnitude (the first one), iscale = -127 / max, q =
+// min(127, nearest_int(iscale x)) - the product rounded to F32 before the magic-number rounding, as the source does
+// (src/kernels/cuda/quantize_act.cu's note) - and d = 1 / iscale, written to each of the 256's eight 32-blocks of d:
+// the kernels' sums then take the CPU lane's int8 values and scale, so an expert gives the same sums on either lane
+// (up to their order, as MXFP4's do) wherever the placement, the expert cache or the PCIe lane puts it: Maya-S's
+// tokens no longer depend on the placement (Strix Halo, --vram-experts 1.0 vs 0.85: 96 of 96 tokens the same, 50 with
+// the per-32 rounding), the KL against the FP8 reference the same (0.162 against 0.171, two sequences), the kernels
+// as fast (6 IQ2_XXS / IQ3_XXS experts 275 against 280 us).  DS4_IQ_Q8K=0: the per-32 rounding (q8_1's), as before
+__device__ __forceinline__ int q8k_nearest(float fval) {   // ggml's nearest_int
+    const float val = __fadd_rn(fval, 12582912.0f);
+    int i;
+    memcpy(&i, &val, 4);
+    return (i & 0x007fffff) - 0x00400000;
+}
+__global__ void __launch_bounds__(256) q8k_quant_kernel(const float* __restrict__ x, size_t ldx, int k,
+                                                        int8_t* __restrict__ q, float* __restrict__ d) {
+    __shared__ float s_am[8];
+    __shared__ int s_at[8];
+    const int r = blockIdx.y, j = (int) threadIdx.x, lane = j & 31, w = j >> 5;
+    const size_t at = (size_t) blockIdx.x * 256 + (size_t) j;
+    const float v = x[(size_t) r * ldx + at];
+    float am = fabsf(v);
+    int ix = j;   // (the first index of the largest magnitude: ties keep the lower one)
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float oa = __shfl_xor_sync(0xffffffffu, am, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, ix, o);
+        if (oa > am || (oa == am && oi < ix)) am = oa, ix = oi;
+    }
+    if (lane == 0) s_am[w] = am, s_at[w] = ix;
+    __syncthreads();
+    if (j == 0) {
+        for (int i = 1; i < 8; ++i)
+            if (s_am[i] > s_am[0] || (s_am[i] == s_am[0] && s_at[i] < s_at[0])) s_am[0] = s_am[i], s_at[0] = s_at[i];
+    }
+    __syncthreads();
+    const float amax = s_am[0];
+    int8_t qv = 0;
+    float dv = 0.0f;
+    if (amax > 0.0f) {
+        const float mx = x[(size_t) r * ldx + (size_t) blockIdx.x * 256 + (size_t) s_at[0]];
+        const float iscale = __fdiv_rn(-127.0f, mx);
+        qv = (int8_t) min(127, q8k_nearest(__fmul_rn(iscale, v)));
+        dv = __fdiv_rn(1.0f, iscale);
+    }
+    q[(size_t) r * k + at] = qv;
+    if (lane == 0) d[(size_t) r * (k / 32) + at / 32] = dv;
+}
+void q8k_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
+    q8k_quant_kernel<<<dim3((unsigned) (k / 256), (unsigned) rows), 256, 0, s>>>(x, ldx, k, q, d);
+}
+// the low-bit experts' activations: Q8_K's rounding (the CPU lane's; DS4_IQ_Q8K=0: q8_1's, per 32)
+bool iq_q8k() {
+    static const bool on = [] {
+        const char* v = std::getenv("DS4_IQ_Q8K");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+void iq_act_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
+    if (iq_q8k() && k % 256 == 0) q8k_quant(x, ldx, rows, k, q, d, s);
+    else q8_quant(x, ldx, rows, k, q, d, s);
+}
+
 // 8 E2M1 codes (a word of 4 code bytes) -> their values as int8: .x the low nibbles' (values 0..3 of the word's bytes),
 // .y the high nibbles' - llama.cpp's get_int_from_table_16 (MIT), the table kvalues_mxfp4
 __device__ __forceinline__ int2 e2m1_x8(uint32_t q4) {
@@ -615,6 +680,8 @@ struct SetK {
     float* y;             // down: F32 out
     int ldo;
     int skip_le;          // the experts of at most this many rows left out (the light kernels took them; ds4_iq.cuh)
+    int xh_vec;           // (AMD's tiles) xh 16-byte aligned F16 rows - gate / up too when the caller gave them (x16, the
+                          // rows_f16 of xf: the same bits) - read 8 values a load
 };
 
 // one 32-value block of BN weight rows (rows c0 .., row bytes rb, block kb) -> ws[32][BN + 1]
@@ -838,14 +905,12 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
     struct Tiles {
         _Float16 x[BM][kLdH], wg[BN][kLdH], wu[GATE_UP ? BN : 1][kLdH];
     };
-    struct Out {
-        float g[BM][BN + 4], u[GATE_UP ? BM : 1][BN + 4];
-    };
-    __shared__ __align__(16) unsigned char smem[sizeof(Tiles) > sizeof(Out) ? sizeof(Tiles) : sizeof(Out)];
+    // (the results go out from the accumulators, whose rows set_wmma_row knows: no 64 x 64 staging of them - 15 KB of
+    // shared memory a block, not 35, so more blocks a CU)
+    __shared__ __align__(16) unsigned char smem[sizeof(Tiles)];
     __shared__ float lut[16];
     __shared__ int src[BM];
     Tiles& T = *reinterpret_cast<Tiles*>(smem);
-    Out& O = *reinterpret_cast<Out*>(smem);
     lut_init(lut);
     const int e = blockIdx.z;
     const int lo = a.bounds[e] - a.row0, hi_r = a.bounds[e + 1] - a.row0;
@@ -879,14 +944,20 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
             }
         }
         const int sr = src[tr];
+        if (a.xh_vec) {   // (F16 rows: 8 values in one 16-byte load)
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (sr >= 0) v = *reinterpret_cast<const uint4*>(a.xh + (size_t) sr * a.ldx + (size_t) kb * kMxBlock + tq * 8);
+            *reinterpret_cast<uint4*>(&T.x[tr][tq * 8]) = v;
+        } else {
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            float v = 0.0f;
-            if (sr >= 0) {
-                const size_t at = (size_t) sr * a.ldx + (size_t) kb * kMxBlock + tq * 8 + j;
-                v = GATE_UP ? a.xf[at] : __half2float(a.xh[at]);
+            for (int j = 0; j < 8; ++j) {
+                float v = 0.0f;
+                if (sr >= 0) {
+                    const size_t at = (size_t) sr * a.ldx + (size_t) kb * kMxBlock + tq * 8 + j;
+                    v = GATE_UP ? a.xf[at] : __half2float(a.xh[at]);
+                }
+                T.x[tr][tq * 8 + j] = (_Float16) v;
             }
-            T.x[tr][tq * 8 + j] = (_Float16) v;
         }
         __syncthreads();
 #pragma unroll
@@ -914,17 +985,11 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const int r = wm_ * 16 + set_wmma_row(i, hi), cc = (wn + j) * 16 + l16;
-            O.g[r][cc] = fg[j][i];
-            if (GATE_UP) O.u[r][cc] = fu[j][i];
+            if (r >= nr) continue;
+            const size_t lr = (size_t) (r0 + r);
+            if (GATE_UP) a.h[lr * a.ldo + c0 + cc] = __float2half_rn(swiglu(fg[j][i], fu[j][i], a.limit));
+            else a.y[lr * a.ldo + c0 + cc] = fg[j][i];
         }
-    __syncthreads();
-    for (int i = tid; i < BM * BN; i += kThreads) {
-        const int r = i / BN, cc = i % BN;
-        if (r >= nr) continue;
-        const size_t lr = (size_t) (r0 + r);
-        if (GATE_UP) a.h[lr * a.ldo + c0 + cc] = __float2half_rn(swiglu(O.g[r][cc], O.u[r][cc], a.limit));
-        else a.y[lr * a.ldo + c0 + cc] = O.g[r][cc];
-    }
 }
 #endif
 bool tc_ok() {   // sm_70 and later (WMMA F16) / AMD gfx11, gfx12 (wave32 WMMA); STRATA_DS4_NO_TC=1 keeps the F32 kernel
@@ -1010,7 +1075,7 @@ size_t row_stride(const x3::Mat& m) {   // values (BF16) or bytes (MXFP4, Q8_0, 
     if (m.ld > 0) return (size_t) m.ld;
     return m.fmt == kFmtMXFP4 ? mx_row_bytes(m.k)
            : m.fmt == kFmtQ8_0 ? q8_row_bytes(m.k)
-           : m.fmt == kFmtGG   ? type_row_bytes(m.K, m.k)
+           : m.fmt == kFmtGG   ? type_row_bytes(m.gg_type, m.k)
                                : (size_t) m.k;
 }
 // a layer's low-bit experts as ds4_iq's arguments (false: its types not covered - printed)
@@ -1079,17 +1144,20 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
         if (m.fmt == kFmtGG) {   // the activations rounded to int8 (job i's rows of the scratch), then ds4_iq's GEMV
             Scratch* sc = scratch(s);
             if (sc == nullptr || m.raw == nullptr || q.xf == nullptr || q.y == nullptr || q.ncol < 1 ||
-                q.ncol > x3::kMaxMvCols || m.k > kMaxQK || type_row_bytes(m.K, m.k) == 0) {
-                std::fprintf(stderr, "ds4 gguf mv: job %d unsupported (type %s k %d n %d)\n", i, type_name(m.K), m.k, m.n);
+                q.ncol > x3::kMaxMvCols || m.k > kMaxQK || type_row_bytes(m.gg_type, m.k) == 0) {
+                std::fprintf(stderr, "ds4 gguf mv: job %d unsupported (type %s k %d n %d)\n", i, type_name(m.gg_type), m.k,
+                             m.n);
                 g_errors.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
+            // (per 32: a dense matrix - the CPU lane computes only experts, so Q8_K's rounding, a scale per 256, would only
+            //  lose precision here)
             q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
             iq::MvJob& b = IJ[nij++];
             b.w = (const uint8_t*) m.raw;
             b.ld = row_stride(m);
-            b.type = m.K;
+            b.type = m.gg_type;
             b.k = m.k;
             b.n = m.n;
             b.ncol = q.ncol;
@@ -1196,6 +1264,11 @@ MxArgs mx_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit) {
 }
 }  // namespace
 
+void act_q8k(const float* x, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
+    q8k_quant(x, (size_t) k, rows, k, q, d, s);
+    check("act_q8k");
+}
+
 void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s) {
     if (!mx_geometry("moe_gate_up", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
     Scratch* sc = scratch(s);
@@ -1207,7 +1280,7 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
         ia.h = h;
         ia.xq = sc->xq;
         ia.xd = sc->xd;
-        q8_quant(x, (size_t) a.n_embd, 1, a.n_embd, sc->xq, sc->xd, s);
+        iq_act_quant(x, (size_t) a.n_embd, 1, a.n_embd, sc->xq, sc->xd, s);
         iq::gate_up(ia, a.k, 1, s);
         check("moe_gate_up");
         return;
@@ -1233,7 +1306,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     m.part = sc->part;
     m.hq = sc->hq;
     m.hd = sc->hd;
-    q8_quant(h, (size_t) a.n_ff, a.k, a.n_ff, sc->hq, sc->hd, s);
+    (mx_experts(a.lay) ? q8_quant : iq_act_quant)(h, (size_t) a.n_ff, a.k, a.n_ff, sc->hq, sc->hd, s);
     if (!mx_experts(a.lay)) {   // low-bit experts: ds4_iq's down, then the same combine
         iq::Args ia;
         if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down")) return;
@@ -1298,10 +1371,11 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
         ia.hq = sc->hq;
         ia.hd = sc->hd;
     }
-    q8_quant(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
+    (mx_experts(a.lay) ? q8_quant : iq_act_quant)(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
     if (mx) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
     else iq::gate_up(ia, groups, a.T, s);
-    q8_quant(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);   // (rows of picks not on the device: unused)
+    // (rows of picks not on the device: unused)
+    (mx_experts(a.lay) ? q8_quant : iq_act_quant)(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);
     if (mx) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
     else iq::down(ia, groups, a.T, s);
     if (a.wait_ptr != nullptr) mx_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
@@ -1340,7 +1414,7 @@ iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (th
 }  // namespace
 
 void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
-                 cudaStream_t s) {
+                 cudaStream_t s, const uint16_t* x16) {
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
     if (!mx_geometry("set_gate_up", 1, sa.n_embd, sa.n_ff)) return;
     if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
@@ -1348,6 +1422,7 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
         if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up")) return;
         iq::SetArgs q = iq_set(sa);
         q.xf = x;
+        q.xh = x16;   // (the tensor-core tiles' FP16 rows; the light kernels keep xf)
         q.idx = row_idx;
         q.ldx = ldx;
         q.h = h16;
@@ -1387,9 +1462,11 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
     k.limit = sa.limit;
     k.xf = x;
     k.idx = row_idx;
+    k.xh = (const __half*) x16;
     k.ldx = ldx;
     k.h = (__half*) h16;
     k.ldo = ldh;
+    k.xh_vec = x16 != nullptr && ((uintptr_t) x16 & 15) == 0 && (ldx & 7) == 0;
     const dim3 grid((unsigned) ((sa.max_rows + BM - 1) / BM), (unsigned) (sa.n_ff / BN), (unsigned) sa.n_exp);
 #if !defined(STRATA_USE_HIP)
     if (tc_ok()) mx_set_tc_kernel<true><<<grid, kThreads, 0, s>>>(k);
@@ -1447,6 +1524,7 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
     k.ldx = ldh;
     k.y = y;
     k.ldo = ldy;
+    k.xh_vec = ((uintptr_t) h16 & 15) == 0 && (ldh & 7) == 0;
     const dim3 grid((unsigned) ((sa.max_rows + BM - 1) / BM), (unsigned) (sa.n_embd / BN), (unsigned) sa.n_exp);
 #if !defined(STRATA_USE_HIP)
     if (tc_ok()) mx_set_tc_kernel<false><<<grid, kThreads, 0, s>>>(k);

@@ -12,7 +12,7 @@ It first asks which model to set up:
   (211 GB) or [at 3.5 bits](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) (258 GB, about
   280 GB of VRAM and RAM; `--ds4-quant exl3-3.5`, its own folder; a second quant hard-links the Engram tables from the
   first instead of downloading them) and its two Engram tables from [DeepSeek's repo](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
-  (203 GB), on its own engine (`build/maya-ds4`): Linux, NVIDIA RTX 30 / A100 or newer. It is fast with about 230 GB
+  (203 GB), on its own engine (`build/maya-ds4`): Linux, NVIDIA V100 or newer (pictures: RTX 30 / A100 or newer). It is fast with about 230 GB
   of VRAM and RAM together; with less, the setup warns and the engine reads the experts that do not fit from the
   model's files on the SSD (`--mmap-experts auto`), much slower - one RTX 3090 with 64 GB of RAM: prompts about 50
   tokens/s, answers 4-5 tokens/s (faster with `--dspark none`). The same steps with these differences: the
@@ -20,7 +20,11 @@ It first asks which model to set up:
   sources and checks every file against its pinned size (and, once downloaded, its sha256: `tools/ds4/download.json`, `download-3.5bpw.json`);
   `--model-dir DIR` uses files you already have; the pack is `DIR/maya-ds4/` (`tools/ds4/pack.py`, about a minute);
   pictures need nothing more - the model's own vision tower runs in the engine; the config is `maya-ds4.json`, with
-  tensor parallel across pairs of equal GPUs (`--tp 2`); there is no tuning step (the engine balances its own split).
+  tensor parallel across pairs of equal GPUs (`--tp 2`). The engine balances its own layer split; `./maya.sh --calibrate`
+  (not offered by the setup) measures each `--tp` that groups your GPUs differently and fewer CPU threads, an engine
+  start each (about an hour on 9 GPUs), and keeps the fastest answers whose long prompts still read at 60% of the
+  config's own `--tp`'s speed; a setting the engine does not start with is left out (`tools/calibrate_ds4_tp.py`; the
+  result goes into `maya-ds4.json` and a setup again keeps it).
 
   Or from [unsloth's GGUFs](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (`--ds4-quant`; the setup asks):
   **UD-Q8_K_XL** (508 GB, the default: dense weights BF16, routed experts MXFP4, the Engram tables FP8 - DeepSeek's own
@@ -65,7 +69,9 @@ GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
 
 **Next time**, just run `./setup.sh` again (or the model's `./run-maya-<model>.sh`): it starts right away, nothing is
 downloaded twice, on the same screen - its dashboard shows the Monitor's numbers (the speed, where the experts live, the
-GPUs, the requests), Tab its log. Ctrl+C stops it.
+GPUs, the requests), Tab its log. Ctrl+C stops it - and so does any other way of ending `maya.py`: `kill`, a
+service manager, closing the terminal or the window, even a crash: the server and the engine end with it (the
+engine keeps its conversation where there is time for that).
 
 **Updating:** the dashboard's **About** says when a new version is out, and its **Update** button does it: Maya
 downloads the new code (git), compiles only the engine files that changed and loads the same model again - the model
@@ -94,8 +100,9 @@ is not downloaded again, and your settings stay. By hand: `git pull`, then `./se
 | `--host-compiler g++-12` | when your g++ is newer than your CUDA accepts ("unsupported GNU version") |
 | `--rebuild`, `--repack` | compile the engine / build the pack again |
 | `--calibrate` | tune the engine's CPU lane for this PC (see [Tuning](SETTINGS.md)), then start; with `--no-start` only tune |
-| `--speed-calibration` | measure again whether DFlash2 or the MTP block decodes faster on this PC ([how](SETTINGS.md#the-speed-calibration); 5-20 minutes, with Maya stopped) and keep the faster, then start; with `--no-start` only measure |
-| `--no-speed-calibration` | with `--draft dflash2`: keep DFlash2 without the speed calibration |
+| `--speed-calibration` | measure again whether the drafter (DFlash2, or DeepSeek's DSpark) decodes faster on this PC ([how](SETTINGS.md#the-speed-calibration); 5-30 minutes, with Maya stopped) and keep the faster, then start; with `--no-start` only measure |
+| `--drafting measure\|on\|off` | the drafter without the question: `measure` = the speed calibration (the default with `--yes`), `on` = draft with it, `off` = no drafting - both skip the measuring |
+| `--no-speed-calibration` | the same as `--drafting on` |
 | `--yes` | the recommended answers (the model download still needs `--download-model`) |
 | `--plain` | the setup in plain text with typed answers, and Maya in the terminal, not on their own screen (a pipe gets this too, and `--yes` a plain setup); the setup screen's whole output is in `maya-setup.log` |
 

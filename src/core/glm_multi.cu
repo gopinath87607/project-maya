@@ -178,8 +178,7 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
                  "(%.2f GB in all, with every sequence's snapshot)\n", dev_, n, (long long) max_ctx_,
                  (double) state_bytes_ / 1e9, n - 1, (long long) ctx, (double) more / 1e9);
     // one GPU decodes the sequences together; opt-in split rows need the same activations on every part, before its pool
-    const char* sr = getenv("STRATA_GLM_SPLIT_ROWS");
-    if (n_parts_ == 1 || (sr != nullptr && std::atoi(sr) > 0)) return rows_alloc(err);
+    if (n_parts_ == 1 || split_rows_setting() > 0) return rows_alloc(err);
     return true;
 }
 
@@ -267,7 +266,7 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
     }
     // the logits are the tail's shared scratch: the draw goes on the same stream right behind them, before the next
     // sequence's head can write them again
-    if (sp.greedy || sp.temperature <= 0.0f)
+    if ((sp.greedy || sp.temperature <= 0.0f) && sp.penalty_last_n <= 0)   // (penalties: the sampler's greedy pick)
         gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok, FT->cs);
     else
         tail->pick_tokens(tail->sc_ + tail->sc_logits, 1, sp, nullptr, 0, FT->tok, FT->cs);

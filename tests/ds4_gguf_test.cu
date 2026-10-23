@@ -2,12 +2,15 @@
 // double-precision reference of random BF16 matrices and MXFP4 experts: the GEMVs (BF16 / MXFP4, 1..16 activations,
 // aligned or not), the token experts (gate / up / swiglu / down / combine, experts off the device, the CPU part, the
 // shared expert), a window's grouped experts (bit for bit the token path's), the prompt path's expert sets and the CPU
-// lane's rows; and the KV caches' packed rows (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no
-// model.  ds4_gguf_test [n_embd n_ff] | --kv (the caches alone)
+// lane's rows - for MXFP4 and every low-bit type (IQ1_S .. Q4_K; their decode equal to ggml's dequantize_row_* on
+// random blocks); the PCIe lane's streamed experts (bit for bit the VRAM ones'); and the KV caches' packed rows
+// (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no model.
+// ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone)
 #include "../src/ds4/ds4_gguf.cuh"
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_iq.cuh"
 #include "../src/ds4/ds4_kernels.cuh"
+#include "../src/ds4/ds4_pcie.cuh"
 #include "../src/ds4/ds4_q6k.cuh"
 
 #include "ggml.h"   // (the low-bit types' reference values: ggml's own dequantize_row_*)
@@ -15,6 +18,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -105,6 +109,27 @@ std::vector<float> q8_round(const float* x, int k) {
         for (int j = 0; j < 32; ++j) {
             const float q = am > 0.0f ? std::nearbyint(x[b * 32 + j] / sc) : 0.0f;
             v[b * 32 + j] = (float) ((double) q * sc);
+        }
+    }
+    return v;
+}
+// x rounded as the low-bit experts' kernels round it (iq_act_quant): ggml's Q8_K per 256 values (max = the signed
+// value of the largest magnitude, the first one; iscale = -127 / max; q = min(127, round-half-even(iscale x)), the
+// product rounded to F32 first; d = 1 / iscale), or q8_round's per 32 with DS4_IQ_Q8K=0 or k not a multiple of 256
+std::vector<float> act_round(const float* x, int k) {
+    const char* on = std::getenv("DS4_IQ_Q8K");
+    if ((on != nullptr && std::atoi(on) == 0) || k % 256 != 0) return q8_round(x, k);
+    std::vector<float> v(k, 0.0f);
+    for (int b = 0; b < k / 256; ++b) {
+        const float* xb = x + (size_t) b * 256;
+        int at = 0;
+        for (int j = 1; j < 256; ++j)
+            if (std::fabs(xb[j]) > std::fabs(xb[at])) at = j;
+        if (xb[at] == 0.0f) continue;
+        const float iscale = -127.0f / xb[at], d = 1.0f / iscale;
+        for (int j = 0; j < 256; ++j) {
+            const float q = std::min(127.0f, std::nearbyint(iscale * xb[j]));
+            v[(size_t) b * 256 + j] = (float) ((double) q * d);
         }
     }
     return v;
@@ -466,6 +491,21 @@ void test_experts(int D, int F, cudaStream_t s) {
         CU(cudaStreamSynchronize(s));
         std::vector<uint16_t> h16 = host(dh16, (size_t) R * F);
         std::vector<float> y = host(dy, (size_t) R * D);
+        {   // gate / up given the rows in FP16 too (the prompt path's x16: rows_f16 of the same rows) - bit for bit
+            std::vector<uint16_t> x16(xs.size());
+            for (size_t i = 0; i < xs.size(); ++i) {
+                const __half h = __float2half_rn(xs[i]);
+                std::memcpy(&x16[i], &h, 2);
+            }
+            uint16_t* dx16 = dev(x16);
+            uint16_t* dh2 = dev(std::vector<uint16_t>((size_t) R * F));
+            gg::set_gate_up(sa, dxs, D, didx, dh2, F, s, dx16);
+            CU(cudaStreamSynchronize(s));
+            const bool same = host(dh2, (size_t) R * F) == h16;
+            std::printf("  set gate/up, %d rows, F16 rows given       %s\n", R, same ? "ok    (bit for bit the F32 rows')" : "FAIL");
+            if (!same) ++g_fail;
+            cudaFree(dx16), cudaFree(dh2);
+        }
         std::vector<float> hgot((size_t) R * F);
         std::vector<double> hwant((size_t) R * F), ywant((size_t) R * D);
         // (an expert of at most 16 rows takes the light kernels: its inputs rounded to int8 per 32, as the token path's)
@@ -588,6 +628,18 @@ std::vector<uint8_t> q_rand(int type, int n, int k) {
             case gg::iq::kQ4_K: put(o, d), put(o + 2, 0.5f * d); break;
             case gg::iq::kQ2_K: put(o + 80, d), put(o + 82, 0.5f * d); break;
             case gg::iq::kQ3_K: put(o + 108, d); break;
+            case gg::iq::kIQ1_M: {   // (d: an F16 in the top nibbles of the 4 scale words, bytes 48..55)
+                const __half h = __float2half(d);
+                uint16_t u;
+                std::memcpy(&u, &h, 2);
+                for (int i = 0; i < 4; ++i) {
+                    uint16_t sw;
+                    std::memcpy(&sw, &w[o + 48 + 2 * i], 2);
+                    sw = (uint16_t) ((sw & 0x0FFFu) | (((u >> (4 * i)) & 0xFu) << 12));
+                    std::memcpy(&w[o + 48 + 2 * i], &sw, 2);
+                }
+                break;
+            }
             default: put(o, d); break;   // (the i-quants: d first)
         }
     }
@@ -603,6 +655,43 @@ double q_dot(int type, const uint8_t* row, int k, const float* x) {
     return s;
 }
 const char* tn(int t) { return gg::type_name(t); }
+const int kQTypes[] = {gg::iq::kIQ2_XXS, gg::iq::kIQ2_XS, gg::iq::kIQ2_S, gg::iq::kIQ3_XXS, gg::iq::kIQ3_S,
+                       gg::iq::kIQ4_XS,  gg::iq::kQ2_K,    gg::iq::kQ3_K,  gg::iq::kQ4_K,    gg::iq::kIQ1_S,
+                       gg::iq::kIQ1_M};
+
+// every low-bit type's decode against ggml's own dequantize_row_* on random blocks: the token / window / light
+// kernels' codes times their scales, and the prompt tiles' loader - each value equal to ggml's (a zero's sign aside)
+void test_decode_values(cudaStream_t s) {
+    for (int t : kQTypes) {
+        const int k = 2048, n = 40;
+        const std::vector<uint8_t> w = q_rand(t, n, k);
+        std::vector<float> want((size_t) n * k);
+        ggml_get_type_traits((ggml_type) t)->to_float(w.data(), want.data(), (int64_t) n * k);
+        uint8_t* dw = dev(w);
+        float* dsub = dev(std::vector<float>((size_t) n * k, -1.0f));
+        float* dtile = dev(std::vector<float>((size_t) n * k, -1.0f));
+        const bool ran = gg::iq::decode_values(t, dw, k, n, dsub, dtile, s);
+        CU(cudaStreamSynchronize(s));
+        const std::vector<float> gs = host(dsub, (size_t) n * k), gt = host(dtile, (size_t) n * k);
+        size_t bs = 0, bt = 0, at = want.size();
+        for (size_t i = 0; i < want.size(); ++i) {
+            const bool a = !(gs[i] == want[i]), b = !(gt[i] == want[i]);
+            bs += a;
+            bt += b;
+            if ((a || b) && at == want.size()) at = i;
+        }
+        const bool ok = ran && bs == 0 && bt == 0;
+        if (!ok) ++g_fail;
+        char what[96];
+        std::snprintf(what, sizeof what, "decode %s = ggml's dequantize_row", tn(t));
+        if (ok) std::printf("%-44s ok    %d values, kernels and tiles\n", what, n * k);
+        else
+            std::printf("%-44s FAIL  %s%zu kernel / %zu tile values differ (first at %zu: %.9g / %.9g vs %.9g)\n", what,
+                        ran ? "" : "not run; ", bs, bt, at, at < want.size() ? gs[at] : 0.0f,
+                        at < want.size() ? gt[at] : 0.0f, at < want.size() ? want[at] : 0.0f);
+        cudaFree(dw), cudaFree(dsub), cudaFree(dtile);
+    }
+}
 
 void test_mv_q(int type, cudaStream_t s) {
     for (int nc : {1, 3, 16}) {
@@ -616,7 +705,7 @@ void test_mv_q(int type, cudaStream_t s) {
         uint8_t* dw = dev(wq);
         x3::Mat m;
         m.fmt = gg::kFmtGG;
-        m.K = type;
+        m.gg_type = type;
         m.raw = dw;
         m.k = k;
         m.n = n;
@@ -662,15 +751,15 @@ QExperts make_q(int D, int F, int n_exp, int tg, int td) {
     size_t off = 0;
     for (int r = 0; r < 3; ++r) {
         E.lay.trellis[r] = off;
-        E.lay.K[r] = r < 2 ? tg : td;
-        off += ((r < 2 ? F : D) * gg::type_row_bytes(E.lay.K[r], r < 2 ? D : F) + 255) / 256 * 256;
+        E.lay.gg_type[r] = r < 2 ? tg : td;
+        off += ((r < 2 ? F : D) * gg::type_row_bytes(E.lay.gg_type[r], r < 2 ? D : F) + 255) / 256 * 256;
     }
     E.lay.fmt = gg::kFmtMXFP4;
     E.blob = off;
     E.host.assign(E.blob * n_exp, 0);
     for (int e = 0; e < n_exp; ++e)
         for (int r = 0; r < 3; ++r) {
-            const std::vector<uint8_t> m = q_rand(E.lay.K[r], r < 2 ? F : D, r < 2 ? D : F);
+            const std::vector<uint8_t> m = q_rand(E.lay.gg_type[r], r < 2 ? F : D, r < 2 ? D : F);
             std::memcpy(E.host.data() + e * E.blob + E.lay.trellis[r], m.data(), m.size());
         }
     E.dev = dev(E.host);
@@ -706,21 +795,7 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
     float *dx = dev(x), *dsh = dev(sh), *dcpu = dev(cpu), *dpw = dev(pw);
     unsigned long long* dpp = dev(pp);
     int* dflag = dev(cflag);
-    std::vector<double> want((size_t) T * D, 0.0);
-    for (int t = 0; t < T; ++t) {
-        const std::vector<float> xr = q8_round(x.data() + (size_t) t * D, D);
-        for (int i = 0; i < k; ++i) {
-            if (pp[t * 8 + i] == 0ull) continue;
-            const int e = pick[t * 8 + i];
-            std::vector<float> h(F);
-            for (int f = 0; f < F; ++f) h[f] = (float) swiglu(E.dot(e, 0, f, xr.data()), E.dot(e, 1, f, xr.data()), lim);
-            const std::vector<float> hr = q8_round(h.data(), F);
-            for (int d = 0; d < D; ++d) want[(size_t) t * D + d] += pw[t * 8 + i] * E.dot(e, 2, d, hr.data());
-        }
-        for (int d = 0; d < D; ++d)
-            want[(size_t) t * D + d] += (cflag[t] ? cpu[(size_t) t * D + d] : 0.0f) + sh[(size_t) t * D + d];
-    }
-    std::vector<float> tok((size_t) T * D);
+    std::vector<float> tok((size_t) T * D), gh((size_t) T * 8 * F);
     float* dh = dev(std::vector<float>((size_t) 8 * F));
     float* dout = dev(std::vector<float>(D));
     for (int t = 0; t < T; ++t) {
@@ -738,10 +813,35 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
         gg::moe_down(a, dh, dsh + (size_t) t * D, dout, s);
         CU(cudaStreamSynchronize(s));
         CU(cudaMemcpy(tok.data() + (size_t) t * D, dout, (size_t) D * 4, cudaMemcpyDeviceToHost));
+        CU(cudaMemcpy(gh.data() + (size_t) t * 8 * F, dh, (size_t) 8 * F * 4, cudaMemcpyDeviceToHost));
+    }
+    // the reference: gate / up in double on the int8 x, then the down on the device's own h rounded as the kernels
+    // round it (an h within F32 rounding of the double one can still round to the next int8 - a test artefact, not the
+    // kernels': the GPU's swiglu is F32), the h checked against the double one apart
+    std::vector<double> want((size_t) T * D, 0.0), hwant;
+    std::vector<float> hgot;
+    for (int t = 0; t < T; ++t) {
+        const std::vector<float> xr = act_round(x.data() + (size_t) t * D, D);
+        for (int i = 0; i < k; ++i) {
+            if (pp[t * 8 + i] == 0ull) continue;
+            const int e = pick[t * 8 + i];
+            const float* h = gh.data() + ((size_t) t * 8 + i) * F;
+            for (int f = 0; f < F; ++f) {
+                hwant.push_back(swiglu(E.dot(e, 0, f, xr.data()), E.dot(e, 1, f, xr.data()), lim));
+                hgot.push_back(h[f]);
+            }
+            const std::vector<float> hr = act_round(h, F);
+            for (int d = 0; d < D; ++d) want[(size_t) t * D + d] += pw[t * 8 + i] * E.dot(e, 2, d, hr.data());
+        }
+        for (int d = 0; d < D; ++d)
+            want[(size_t) t * D + d] += (cflag[t] ? cpu[(size_t) t * D + d] : 0.0f) + sh[(size_t) t * D + d];
     }
     char what[96];
     std::snprintf(what, sizeof(what), "%s/%s token experts (D %d, F %d)", tn(tg), tn(td), D, F);
     expect(what, tok.data(), want.data(), want.size(), 1e-3);
+    // (1e-3 as the output's: on HIP / Windows one token's host-emulated Q8_K x took an int8 apart from the device's -
+    // 2e-4 at full size; the device's Q8_K is byte for byte the CPU lane's, test_q8k)
+    expect("  ... their h (gate / up, swiglu)", hgot.data(), hwant.data(), hwant.size(), 1e-3);
     // the window
     std::vector<unsigned long long> gptr;
     std::vector<int> gstart, gent;
@@ -828,6 +928,21 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
         CU(cudaStreamSynchronize(s));
         std::vector<uint16_t> h16 = host(dh16, (size_t) R * F);
         std::vector<float> y = host(dy, (size_t) R * D);
+        {   // gate / up given the rows in FP16 too (the prompt path's x16: rows_f16 of the same rows) - bit for bit
+            std::vector<uint16_t> x16(xs.size());
+            for (size_t i = 0; i < xs.size(); ++i) {
+                const __half h = __float2half_rn(xs[i]);
+                std::memcpy(&x16[i], &h, 2);
+            }
+            uint16_t* dx16 = dev(x16);
+            uint16_t* dh2 = dev(std::vector<uint16_t>((size_t) R * F));
+            gg::set_gate_up(sa, dxs, D, didx, dh2, F, s, dx16);
+            CU(cudaStreamSynchronize(s));
+            const bool same = host(dh2, (size_t) R * F) == h16;
+            std::printf("  set gate/up, %d rows, F16 rows given       %s\n", R, same ? "ok    (bit for bit the F32 rows')" : "FAIL");
+            if (!same) ++g_fail;
+            cudaFree(dx16), cudaFree(dh2);
+        }
         std::vector<float> hgot((size_t) R * F);
         std::vector<double> hwant((size_t) R * F), ywant((size_t) R * D);
         // (the light kernels, experts of <= 16 rows: the inputs rounded to int8 per 32 as the token path rounds them; the
@@ -943,7 +1058,9 @@ const std::pair<int, int> kQPairs[] = {
     {gg::iq::kIQ2_XXS, gg::iq::kIQ3_XXS}, {gg::iq::kIQ2_XS, gg::iq::kIQ3_XXS}, {gg::iq::kIQ3_XXS, gg::iq::kIQ2_XS},
     {gg::iq::kIQ2_S, gg::iq::kIQ3_S},     {gg::iq::kIQ3_XXS, gg::iq::kIQ3_S},   {gg::iq::kIQ4_XS, gg::iq::kQ4_K},
     {gg::iq::kQ2_K, gg::iq::kQ3_K},       {gg::iq::kQ4_K, gg::iq::kIQ4_XS},     {gg::iq::kQ3_K, gg::iq::kQ2_K},
-    {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS},   {gg::iq::kIQ3_S, gg::iq::kIQ2_S},     {gg::iq::kIQ2_XS, gg::kTypeMXFP4}};
+    {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS},   {gg::iq::kIQ3_S, gg::iq::kIQ2_S},     {gg::iq::kIQ2_XS, gg::kTypeMXFP4},
+    {gg::iq::kIQ1_S, gg::iq::kIQ1_M},     {gg::iq::kIQ1_M, gg::iq::kIQ1_S},     {gg::iq::kIQ1_M, gg::iq::kIQ2_XXS}};
+constexpr int kQPairIQ1 = 12;   // (the first IQ1 pair)
 
 // the Engram table's Q6_K rows (ds4_kernels.cu's q6k_value, engram_dequant / engram_dequant_tok fmt 1) against
 // ggml's dequantize_row_q6_K, bit for bit: the rows are random bytes, each block's d a small positive half
@@ -992,17 +1109,29 @@ void test_engram_q6(cudaStream_t s) {
     }
 }
 
-// a token's 6 low-bit experts at full size: GB/s of the weights read
-void bench_q(cudaStream_t s) {
+// a token's 6 low-bit experts at full size: GB/s of the weights read (only: the token experts of the first pair - the
+// reference - and of the pairs with a type whose name holds it, e.g. "IQ1"; no prompt sets)
+void bench_q(cudaStream_t s, const char* only = nullptr) {
     cudaEvent_t a, b;
     cudaEventCreate(&a);
     cudaEventCreate(&b);
     const int D = 5120, F = 2304;
     for (const auto& pr : kQPairs) {
+        if (only != nullptr && &pr != &kQPairs[0] && std::strstr(tn(pr.first), only) == nullptr &&
+            std::strstr(tn(pr.second), only) == nullptr)
+            continue;
         QExperts E = make_q(D, F, 6, pr.first, pr.second);
-        std::vector<unsigned long long> pp(8, 0ull);
+        // 8 copies of the 6 experts, the token's plan going round them: 48 experts' weights, past the GPU's last-level
+        // caches (Strix Halo's 32 MB Infinity Cache would otherwise hold one token's IQ1 experts between the calls)
+        constexpr int NS = 8;
+        uint8_t* big = nullptr;
+        CU(cudaMalloc(&big, (size_t) NS * 6 * E.blob));
+        for (int c = 0; c < NS; ++c)
+            CU(cudaMemcpy(big + (size_t) c * 6 * E.blob, E.dev, 6 * E.blob, cudaMemcpyDeviceToDevice));
+        std::vector<unsigned long long> pp((size_t) 8 * NS, 0ull);
         std::vector<float> pw(8, 0.1f);
-        for (int i = 0; i < 6; ++i) pp[i] = (unsigned long long) (E.dev + (size_t) i * E.blob);
+        for (int c = 0; c < NS; ++c)
+            for (int i = 0; i < 6; ++i) pp[(size_t) c * 8 + i] = (unsigned long long) (big + ((size_t) c * 6 + i) * E.blob);
         unsigned long long* dpp = dev(pp);
         float* dpw = dev(pw);
         float* dx = dev(std::vector<float>(D, 0.01f));
@@ -1011,6 +1140,8 @@ void bench_q(cudaStream_t s) {
         x3::MoeArgs ma;
         ma.plan_ptr = dpp;
         ma.plan_w = dpw;
+        int turn = 0;
+        auto next = [&] { ma.plan_ptr = dpp + (size_t) 8 * (turn++ % NS); };
         ma.lay = E.lay;
         ma.k = 6;
         ma.n_embd = D;
@@ -1031,13 +1162,21 @@ void bench_q(cudaStream_t s) {
         char what[96];
         std::snprintf(what, sizeof(what), "6 %s/%s experts (gate/up + down)", tn(pr.first), tn(pr.second));
         timed(what, gu + dn, [&] {
+            next();
             gg::moe_gate_up(ma, dx, dh, s);
             gg::moe_down(ma, dh, nullptr, dout, s);
         });
-        timed("  gate/up alone", gu, [&] { gg::moe_gate_up(ma, dx, dh, s); });
-        timed("  down + combine alone", dn, [&] { gg::moe_down(ma, dh, nullptr, dout, s); });
-        cudaFree(E.dev), cudaFree(dpp), cudaFree(dpw), cudaFree(dx), cudaFree(dh), cudaFree(dout);
+        timed("  gate/up alone", gu, [&] {
+            next();
+            gg::moe_gate_up(ma, dx, dh, s);
+        });
+        timed("  down + combine alone", dn, [&] {
+            next();
+            gg::moe_down(ma, dh, nullptr, dout, s);
+        });
+        cudaFree(E.dev), cudaFree(big), cudaFree(dpp), cudaFree(dpw), cudaFree(dx), cudaFree(dh), cudaFree(dout);
     }
+    if (only != nullptr) return;
     // the prompt path's sets: 32 experts x R rows (128: an 8K chunk's share of 384 experts; 8: a short prompt's - the
     // weights' bandwidth), the MXFP4 ones first
     for (int R : {128, 8}) {
@@ -1366,6 +1505,32 @@ void kv_same(const char* what, const void* a, const void* b, size_t bytes) {
     std::printf("%-44s %s  %zu bytes %s\n", what, ok ? "ok  " : "FAIL", bytes, ok ? "identical" : "DIFFER");
 }
 
+// the router's F32 GEMV over a prompt's rows (gemv_f32_rows_kernel, kGemvT tokens a block) against a launch a token -
+// bit for bit, so the prompt and the token path route alike (DeepSeek-V4.1's 384 x 5120; odd row and token counts)
+void test_router_rows(cudaStream_t s) {
+    for (int T : {2, 37, 300}) {
+        const int n = 384, k = 5120;
+        std::vector<float> w((size_t) n * k), x((size_t) T * k);
+        for (auto& v : w) v = frand(0.05f);
+        for (auto& v : x) v = frand(2.0f);
+        float *dw = dev(w), *dx = dev(x), *y1 = nullptr, *yt = nullptr;
+        CU(cudaMalloc(&y1, (size_t) T * 1024 * 4));
+        CU(cudaMalloc(&yt, (size_t) T * 1024 * 4));
+        strata::ds4::gemv_f32(dw, dx, n, k, T, yt, 1024, s);
+        for (int t = 0; t < T; ++t) strata::ds4::gemv_f32(dw, dx + (size_t) t * k, n, k, 1, y1 + (size_t) t * 1024, 1024, s);
+        std::vector<float> a((size_t) T * 1024), b((size_t) T * 1024);
+        CU(cudaMemcpy(a.data(), yt, a.size() * 4, cudaMemcpyDeviceToHost));
+        CU(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost));
+        int diff = 0;
+        for (int t = 0; t < T; ++t)
+            for (int r = 0; r < n; ++r) diff += std::memcmp(&a[(size_t) t * 1024 + r], &b[(size_t) t * 1024 + r], 4) != 0;
+        std::printf("router rows, %d tokens vs a launch a token     %s    %d of %d logits differ\n", T,
+                    diff ? "FAIL" : "ok  ", diff, T * n);
+        if (diff) ++g_fail;
+        cudaFree(dw), cudaFree(dx), cudaFree(y1), cudaFree(yt);
+    }
+}
+
 void test_kv_pack(cudaStream_t s) {
     const int HD = 512, IX = 128, NC = 65536 / 4 + 1, WIN = 128;
     // the compressed KV (FP4, an E4M3 scale per 16) and the index keys (FP4, a power-of-two scale per 32)
@@ -1528,6 +1693,33 @@ void test_kv_pack(cudaStream_t s) {
                 CU(cudaEventElapsedTime(&ms, e0, e1));
                 us[w] = ms * 1000.0f / sh.iters;
             }
+            if (T >= 16) {   // kAttnWmma: the matrix cores (RDNA 3; elsewhere the packed kernel - then the same bits)
+                CU(cudaMemset(o2, 0xff, n * 4));
+                dk::sparse_attn(d_q, ext, c4, d_sel, SEL, ar, d_sink, NH, HD, T, scale, o2, s, dk::kKvFp4, dk::kAttnWmma,
+                                &scr);
+                CU(cudaStreamSynchronize(s));
+                const std::vector<float> got = host(o2, n);
+                double e2 = 0, r2 = 0, worst = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    const double dv = (double) got[i] - want[i];
+                    e2 += dv * dv;
+                    r2 += (double) want[i] * want[i];
+                    worst = std::max(worst, std::fabs(dv));
+                }
+                const double rel = std::sqrt(e2 / std::max(r2, 1e-30)), rms = std::sqrt(r2 / (double) n);
+                CU(cudaEventRecord(e0, s));
+                for (int it = 0; it < sh.iters; ++it)
+                    dk::sparse_attn(d_q, ext, c4, d_sel, SEL, ar, d_sink, NH, HD, T, scale, o2, s, dk::kKvFp4,
+                                    dk::kAttnWmma, &scr);
+                CU(cudaEventRecord(e1, s));
+                CU(cudaEventSynchronize(e1));
+                float ms = 0.0f;
+                CU(cudaEventElapsedTime(&ms, e0, e1));
+                const bool ok = rel < 2e-3 && worst < 2e-2 * std::max(rms, 1e-6) * 10;
+                if (!ok) ++g_fail;
+                std::printf("kv pack: sparse attention, %-22s %s  matrix cores: rel %.2e, worst/rms %.2e, %.1f us a call\n",
+                            sh.what, ok ? "ok  " : "FAIL", rel, worst / std::max(rms, 1e-30), ms * 1000.0f / sh.iters);
+            }
             if (!same) ++g_fail;
             char what[96];
             std::snprintf(what, sizeof what, "kv pack: sparse attention, %s", sh.what);
@@ -1609,6 +1801,200 @@ void test_kv_pack(cudaStream_t s) {
 
 }  // namespace
 
+// ---------------------------------------------------------------- the decode path's PCIe lane (ds4_pcie.cuh)
+// A token's 6 experts, 3 of them streamed: off the plan at first (the CPU lane's, to the token path), their blobs in
+// pinned memory (as the host's readers leave them), pulled by stream_fetch into slots elsewhere once their ready flags
+// are set (after the kernel started: it waits for them) - or read where they lie (copy 0: an integrated GPU's way) -
+// taken into the plan, their gate / up in a second pass: the output bit for bit the one with all 6 in the plan from the
+// start (a streamed expert is a VRAM one to the sums); with none streamed, the first pass's alone
+// (blobs on the device, hblobs their bytes on the host)
+void test_lane(const char* name, const x3::ExpertLayout& lay, const uint8_t* blobs, const uint8_t* hblobs, size_t blob,
+               int D, int F, cudaStream_t s) {
+    namespace pc = strata::ds4::pcie;
+    const int k = 6;
+    const float lim = 10.0f;
+    std::vector<float> x(D), sh(D), w(8, 0.0f);
+    for (auto& v : x) v = frand();
+    for (auto& v : sh) v = frand(0.1f);
+    for (int i = 0; i < k; ++i) w[i] = 0.1f + 0.05f * (float) i;
+    float *dx = dev(x), *dsh = dev(sh), *dw = dev(w);
+    float* dh = dev(std::vector<float>((size_t) 8 * F));
+    float *da = dev(std::vector<float>(D)), *db = dev(std::vector<float>(D));
+    uint8_t *slots = nullptr, *pinned = nullptr;
+    CU(cudaMalloc(&slots, 8 * blob));
+    CU(cudaHostAlloc(&pinned, 8 * blob, cudaHostAllocMapped));
+    pc::Pull* pull = nullptr;
+    CU(cudaHostAlloc(&pull, sizeof(pc::Pull), cudaHostAllocMapped));
+    std::memset(pull, 0, sizeof(pc::Pull));
+    unsigned* dflag = dev(std::vector<unsigned>(pc::kPullFlags, 0u));
+    std::vector<unsigned long long> pa(8, 0ull);
+    for (int i = 0; i < k; ++i) pa[i] = (unsigned long long) (blobs + (size_t) i * blob);
+    unsigned long long *dpa = dev(pa), *dpb = nullptr, *dp2 = dev(std::vector<unsigned long long>(8, 0ull));
+    x3::MoeArgs ma;
+    ma.plan_w = dw;
+    ma.lay = lay;
+    ma.k = k;
+    ma.n_embd = D;
+    ma.n_ff = F;
+    ma.limit = lim;
+    ma.plan_ptr = dpa;   // all six in the plan
+    gg::moe_gate_up(ma, dx, dh, s);
+    gg::moe_down(ma, dh, dsh, da, s);
+    CU(cudaStreamSynchronize(s));
+    const std::vector<float> ya = host(da, D);
+    pc::Mats mt;   // (each matrix with the padding after it: within the blob)
+    for (int r = 0; r < 3; ++r) {
+        mt.off[r] = lay.trellis[r];
+        mt.bytes[r] = (r < 2 ? lay.trellis[r + 1] : blob) - lay.trellis[r];
+    }
+    unsigned seq = 100;
+    for (const int copy : {1, 0})
+        for (const unsigned mask : {0x1Au, 0u}) {   // picks 1, 3, 4 streamed; none
+            ++seq;
+            std::vector<unsigned long long> pb = pa;
+            for (int i = 0; i < 8; ++i) {
+                pull->src[i] = 0ull;
+                pull->bad[i] = 0u;
+                for (int r = 0; r < 4; ++r) pull->ready[i][r] = 0u;
+                if (i < k && ((mask >> i) & 1u)) {
+                    pull->src[i] = (unsigned long long) (pinned + (size_t) i * blob);
+                    pb[i] = 0ull;
+                }
+            }
+            dpb = dev(pb);
+            x3::MoeArgs mb = ma;
+            mb.plan_ptr = dpb;
+            gg::moe_gate_up(mb, dx, dh, s);
+            pc::stream_fetch(pull, seq, dflag, slots, blob, mt, copy != 0, dpb, dp2, k, 4, s);
+            x3::MoeArgs m2 = ma;
+            m2.plan_ptr = dp2;
+            gg::moe_gate_up(m2, dx, dh, s);
+            gg::moe_down(mb, dh, dsh, db, s);
+            // the host's side, after the device started waiting: the pull's seq, then each expert's matrices read and
+            // flagged one by one
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            *(volatile unsigned*) &pull->seq = seq;
+            for (int i = 0; i < k; ++i)
+                if ((mask >> i) & 1u)
+                    for (int r = 0; r < 3; ++r) {
+                        std::memcpy(pinned + (size_t) i * blob + mt.off[r], hblobs + (size_t) i * blob + mt.off[r],
+                                    mt.bytes[r]);
+                        std::atomic_thread_fence(std::memory_order_release);
+                        *(volatile unsigned*) &pull->ready[i][r] = seq;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+            CU(cudaStreamSynchronize(s));
+            const std::vector<float> yb = host(db, D);
+            const bool same = std::memcmp(ya.data(), yb.data(), (size_t) D * 4) == 0;
+            const bool done = *(volatile unsigned*) &pull->done == seq;   // (the pull's end, as the host sees it)
+            if (!same || !done) ++g_fail;
+            char what[96];
+            std::snprintf(what, sizeof what, "lane: %s, %s streamed%s", name, mask ? "3 of 6" : "none",
+                          copy ? "" : " (read in place)");
+            std::printf("%-44s %s%s\n", what, same ? "ok    bit for bit all in VRAM" : "FAIL  differs from all in VRAM",
+                        done ? "" : " - FAIL: the pull's end not seen");
+            cudaFree(dpb);
+        }
+    cudaFree(dx), cudaFree(dsh), cudaFree(dw), cudaFree(dh), cudaFree(da), cudaFree(db), cudaFree(slots), cudaFree(dpa);
+    cudaFree(dp2), cudaFree(dflag);
+    cudaFreeHost(pinned), cudaFreeHost(pull);
+}
+// The low-bit experts' activations as the CPU lane rounds them (act_q8k: ggml's Q8_K, the GPU's unless DS4_IQ_Q8K=0):
+// the int8 values and scales byte for byte the CPU lane's (iq_cpu_quant to Q8_K), ties and an all-zero block among
+// them; then each low-bit pair's expert on the GPU (as this process's DS4_IQ_Q8K has it) against the CPU lane's
+// (gg::iq_cpu_*), the largest difference of the output relative to its largest value
+void test_q8k(cudaStream_t s) {
+    const int k = 1024, rows = 6;
+    std::vector<float> x((size_t) rows * k);
+    for (auto& v : x) v = frand();
+    for (int j = 0; j < 256; ++j) x[(size_t) 1 * k + j] = 0.0f;                     // (an all-zero block)
+    x[(size_t) 2 * k + 3] = 2.5f, x[(size_t) 2 * k + 9] = -2.5f;                    // (a tie: the first one's sign)
+    for (int j = 0; j < 256; ++j) x[(size_t) 3 * k + 256 + j] = 0.5f * (float) (j % 7) - 1.5f;   // (exact halves)
+    float* dx = dev(x);
+    int8_t* dq = dev(std::vector<int8_t>((size_t) rows * k));
+    float* dd = dev(std::vector<float>((size_t) rows * k / 32));
+    gg::act_q8k(dx, rows, k, dq, dd, s);
+    CU(cudaStreamSynchronize(s));
+    const std::vector<int8_t> q = host(dq, (size_t) rows * k);
+    const std::vector<float> d = host(dd, (size_t) rows * k / 32);
+    size_t bad = 0;
+    std::vector<uint8_t> blk((size_t) (k / 256) * 292);
+    for (int r = 0; r < rows; ++r) {
+        gg::iq_cpu_quant(15 /* GGML_TYPE_Q8_K */, x.data() + (size_t) r * k, k, blk.data());
+        for (int b = 0; b < k / 256; ++b) {
+            float cd;
+            std::memcpy(&cd, blk.data() + (size_t) b * 292, 4);
+            const int8_t* cq = (const int8_t*) (blk.data() + (size_t) b * 292 + 4);
+            for (int j = 0; j < 256; ++j) bad += cq[j] != q[(size_t) r * k + b * 256 + j];
+            for (int c = 0; c < 8; ++c) bad += std::memcmp(&cd, &d[(size_t) r * (k / 32) + b * 8 + c], 4) != 0;
+        }
+    }
+    if (bad) ++g_fail;
+    std::printf("%-44s %s  %zu of %d values / scales differ\n", "q8k: the GPU's Q8_K = the CPU lane's", bad ? "FAIL" : "ok  ",
+                bad, rows * k + rows * k / 32);
+    cudaFree(dx), cudaFree(dq), cudaFree(dd);
+    const char* on = std::getenv("DS4_IQ_Q8K");
+    for (const auto& pr : kQPairs) {
+        const int D = 1024, F = 512;
+        const float lim = 10.0f;
+        QExperts Q = make_q(D, F, 1, pr.first, pr.second);
+        gg::IqCpu fm;
+        std::string err;
+        if (!gg::iq_cpu_fmt(pr.first, pr.second, D, F, fm, err)) continue;
+        std::vector<float> xs(D);
+        for (auto& v : xs) v = frand();
+        std::vector<uint8_t> aq((size_t) D * 4), hq((size_t) D * 4);
+        std::vector<float> hc(F), yc(D);
+        gg::iq_cpu_quant(fm.gu_act, xs.data(), D, aq.data());
+        const void* ap[1] = {aq.data()};
+        float* hp[1] = {hc.data()};
+        gg::iq_cpu_gate_up(fm, Q.mat(0, 0), Q.mat(0, 1), ap, 1, hp, 0, F, lim);
+        gg::iq_cpu_quant(fm.d_act, hc.data(), F, hq.data());
+        const void* hqp[1] = {hq.data()};
+        float* yp[1] = {yc.data()};
+        gg::iq_cpu_down(fm, Q.mat(0, 2), hqp, 1, yp, 0, D);
+        std::vector<unsigned long long> pp(8, 0ull);
+        pp[0] = (unsigned long long) Q.dev;
+        std::vector<float> w(8, 0.0f);
+        w[0] = 1.0f;
+        unsigned long long* dpp = dev(pp);
+        float *dw = dev(w), *dxs = dev(xs), *dh = dev(std::vector<float>((size_t) 8 * F));
+        float *dsh = dev(std::vector<float>(D, 0.0f)), *dout = dev(std::vector<float>(D));
+        x3::MoeArgs a;
+        a.plan_ptr = dpp;
+        a.plan_w = dw;
+        a.lay = Q.lay;
+        a.k = 1;
+        a.n_embd = D;
+        a.n_ff = F;
+        a.limit = lim;
+        gg::moe_gate_up(a, dxs, dh, s);
+        gg::moe_down(a, dh, dsh, dout, s);
+        CU(cudaStreamSynchronize(s));
+        const std::vector<float> yg = host(dout, D);
+        double mx = 0, worst = 0;
+        for (int i = 0; i < D; ++i) mx = std::max(mx, (double) std::fabs(yc[i]));
+        for (int i = 0; i < D; ++i) worst = std::max(worst, std::fabs((double) yc[i] - (double) yg[i]) / mx);
+        char what[96];
+        std::snprintf(what, sizeof what, "q8k: %s/%s expert, CPU lane vs GPU (%s)", tn(pr.first), tn(pr.second),
+                      on == nullptr || std::atoi(on) != 0 ? "Q8_K" : "per 32");
+        std::printf("%-56s max diff %.3g of the largest output\n", what, worst);
+        cudaFree(dpp), cudaFree(dw), cudaFree(dxs), cudaFree(dh), cudaFree(dsh), cudaFree(dout), cudaFree(Q.dev);
+    }
+}
+void test_lanes(cudaStream_t s) {   // MXFP4 and every low-bit pair
+    Experts M = make_experts(512, 256, 6);
+    test_lane("MXFP4", M.lay, M.dev, M.host.data(), M.blob, 512, 256, s);
+    cudaFree(M.dev);
+    for (const auto& pr : kQPairs) {
+        QExperts Q = make_q(512, 256, 6, pr.first, pr.second);
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "%s/%s", tn(pr.first), tn(pr.second));
+        test_lane(nm, Q.lay, Q.dev, Q.host.data(), Q.blob, 512, 256, s);
+        cudaFree(Q.dev);
+    }
+}
+
 // ---------------------------------------------------------------- Engram rows in Q6_K
 __global__ void q6k_rows_kernel(const uint8_t* rows, int hd, float* out) {   // (engram_dequant's Q6_K branch)
     const int r = blockIdx.x;
@@ -1647,13 +2033,23 @@ int main(int argc, char** argv) {
         bench_q(s);
         return 0;
     }
-    if (argc >= 2 && std::strcmp(argv[1], "--bench-q") == 0) {
-        bench_q(s);
+    if (argc >= 2 && std::strcmp(argv[1], "--bench-q") == 0) {   // [a type name's part: those pairs' token experts]
+        bench_q(s, argc >= 3 ? argv[2] : nullptr);
         return 0;
     }
     if (argc >= 2 && std::strcmp(argv[1], "--bench-cpu") == 0) {   // [threads]
         bench_cpu(argc >= 3 ? std::atoi(argv[2]) : 1);
         return 0;
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--q8k") == 0) {   // the low-bit activations' Q8_K rounding (DS4_IQ_Q8K)
+        test_q8k(s);
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--lane") == 0) {   // the PCIe lane's streamed experts alone
+        test_lanes(s);
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
     }
     if (argc >= 2 && std::strcmp(argv[1], "--kv") == 0) {   // the caches' packing alone
         test_kv_pack(s);
@@ -1661,17 +2057,19 @@ int main(int argc, char** argv) {
         return g_fail ? 1 : 0;
     }
     test_kv_pack(s);
+    test_router_rows(s);
     test_mv(s);
     test_engram_q6k(s);
     test_experts(512, 256, s);
-    for (int t : {gg::iq::kIQ2_XXS, gg::iq::kIQ2_XS, gg::iq::kIQ2_S, gg::iq::kIQ3_XXS, gg::iq::kIQ3_S, gg::iq::kIQ4_XS,
-                  gg::iq::kQ2_K, gg::iq::kQ3_K, gg::iq::kQ4_K})
-        test_mv_q(t, s);
+    test_decode_values(s);
+    for (int t : kQTypes) test_mv_q(t, s);
     for (const auto& pr : kQPairs) test_experts_q(512, 256, pr.first, pr.second, s);
     test_engram_q6(s);
+    test_lanes(s);
     if (argc >= 3) {
         test_experts(std::atoi(argv[1]), std::atoi(argv[2]), s);
-        for (int i : {0, 4}) test_experts_q(std::atoi(argv[1]), std::atoi(argv[2]), kQPairs[i].first, kQPairs[i].second, s);
+        for (int i : {0, 4, kQPairIQ1, kQPairIQ1 + 1})
+            test_experts_q(std::atoi(argv[1]), std::atoi(argv[2]), kQPairs[i].first, kQPairs[i].second, s);
     }
     if (gg::launch_errors() != 0) {
         std::printf("launch errors: %d\n", gg::launch_errors());

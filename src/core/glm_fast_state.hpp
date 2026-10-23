@@ -533,8 +533,23 @@ struct Glm5Model::FastState {
     // (a promotion only adds), so it is set there (check_resident) and holds until the next one.
     // STRATA_GLM_RESIDENT_SKIP=0 launches them anyway (A/B); on by default on AMD only (glmfast::on_by_default_on_amd).
     bool all_resident = false;
+    // STRATA_GLM_SKIP_EMPTY=1: the same per layer for the batched rows (glm_rows.cu; the token path keeps the rule
+    // above, its layers' launches are in its graphs' key) - layer_res[il]: every expert of layer il in VRAM as of the
+    // last boundary, so its routes leave out the wait, the fetch and the CPU lane's wait.  Off: empty.
+    std::vector<uint8_t> layer_res;
+    bool layer_resident(int il) const { return (size_t) il < layer_res.size() && layer_res[(size_t) il] != 0; }
     void check_resident(int l0, int lt, int n_expert) {
         static const bool on = glmfast::on_by_default_on_amd("STRATA_GLM_RESIDENT_SKIP");
+        if (glmfast::skip_empty_on()) {
+            layer_res.assign(L.size(), 0);
+            for (int il = l0; il < lt; ++il) {
+                if (!L[(size_t) il].moe) continue;
+                const int* so = slot_of.data() + (size_t) il * n_expert;
+                bool all = true;
+                for (int e = 0; e < n_expert && all; ++e) all = so[e] >= 0;
+                layer_res[(size_t) il] = all ? 1 : 0;
+            }
+        }
         bool all = on;
         for (int il = l0; il < lt && all; ++il) {
             if (!L[(size_t) il].moe) continue;
@@ -584,9 +599,10 @@ struct Glm5Model::FastState {
     std::vector<int> layer_rc;   // layer -> RAM class
     std::vector<int> ram_of;     // key -> slot in its class, -1
     // STRATA_GLM_TIER_DIAG=1 (debug): how each expert last left the tiers (0 never held, 1 dropped from VRAM, 2 evicted
-    // from RAM, 3 dropped by the prompt path's lending), and the disk reads by that cause
+    // from RAM, 3 dropped by the prompt path's lending, 4 evicted from RAM by the lending's park), and the disk reads by
+    // that cause
     std::vector<uint8_t> left;
-    uint64_t diag_disk[4] = {0, 0, 0, 0}, diag_drop = 0, diag_ram_evict = 0, diag_lend = 0, diag_lend_park = 0, diag_b = 0;
+    uint64_t diag_disk[8] = {}, diag_lend_evict = 0, diag_drop = 0, diag_ram_evict = 0, diag_lend = 0, diag_lend_park = 0, diag_b = 0;
     uint64_t diag_resident_skip = 0;   // RAM-resident mode: spare refills skipped (no free RAM slot, no drop)
     uint64_t diag_dup = 0, diag_adopt = 0;   // the boundary's clean-up: duplicate RAM copies freed, lost ones adopted
     size_t ram_bytes = 0;
@@ -620,6 +636,10 @@ struct Glm5Model::FastState {
     uint32_t upd_g = 0;
     int n_keys = 0;
     uint8_t* scratch = nullptr;
+    // STRATA_GLM_GROUP_EXPERTS: rows 1 .. rows_group - 1's scratch slots, and every row's 8 slot pointers (device)
+    uint8_t* rows_scratch = nullptr;
+    unsigned long long* rows_scr = nullptr;
+    int rows_group = 0;                        // a group's rows at most (0: grouping off)
     std::vector<uint8_t*> stage;   // pinned: disk reads when no RAM slot is free
     size_t stage_bytes = 0;        // ... each (an expert's blob); the start's uploads go through stage[0] too
     std::mutex mu;   // the service thread vs the between-token boundary

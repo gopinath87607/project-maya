@@ -42,6 +42,7 @@
 namespace strata::kernels::glmf {
 struct MoeRequest;
 struct CpuAnswer;
+struct MoeDev;
 }  // namespace strata::kernels::glmf
 
 namespace strata::core {
@@ -274,10 +275,30 @@ public:
     bool vision_reclaim(std::string& err);
     size_t vision_lend_bytes() const;
     int32_t forced(int32_t sampled) {
-        const int32_t t = force_tok_ >= 0 ? force_tok_ : sampled;
+        int32_t t = force_tok_ >= 0 ? force_tok_ : sampled;
         force_tok_ = -1;
+        if (follow_at_ < follow_.size()) {   // --spec-follow: the continuation's token, whatever was picked
+            const int32_t f = follow_[follow_at_++];
+            follow_differ_ += f != t;
+            t = f;
+        }
         return t;
     }
+    /// --spec-follow (STRATA_GLM_SPEC_FOLLOW): the next decoded tokens are `ids`, one a position, instead of the picked
+    /// ones - every decode path takes them through forced(), so the speculative ones keep exactly the drafts that match
+    /// them.  Two builds or settings then decode the same text (the same windows, drafts and routes), which a speed
+    /// A/B needs: a near-tie flip otherwise changes the text and with it the draft acceptance.  Empty: off.
+    void set_follow(std::vector<int32_t> ids) {
+        follow_ = std::move(ids);
+        follow_at_ = 0;
+        follow_differ_ = 0;
+    }
+    /// The continuation's tokens decoded so far, and how many of them differ from the model's own pick.
+    size_t follow_used() const { return follow_at_; }
+    size_t follow_differ() const { return follow_differ_; }
+    /// The continuation's token k places after the one forced() returns next (-1: past its end, or no continuation) -
+    /// a decode that checks a whole window of drafts before it emits any (DFlash2) compares them with these.
+    int32_t follow_peek(size_t k) const { return follow_at_ + k < follow_.size() ? follow_[follow_at_ + k] : -1; }
 
 private:
     bool step(int32_t token, std::string& err);   // one token through all layers
@@ -295,6 +316,8 @@ private:
     int64_t pos_ = 0;
     int64_t max_ctx_ = 0;
     bool loaded_ = false;
+    std::vector<int32_t> follow_;                 // set_follow: the continuation; follow_at_ its next token
+    size_t follow_at_ = 0, follow_differ_ = 0;
 
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
@@ -412,11 +435,11 @@ public:
         // EXL3 experts (exl3.txt, x_cb >= 0): expert e's part r (gate, up, down) piece j (trellis, suh, svh) lies at
         // x_off[9 e + 3 r + j] of shard x_shard[...]; the blob is [gate | up | down], a part [trellis | suh | svh]
         int x_cb = -1;
-        int x_K[3] = {0, 0, 0}, x_k[3] = {0, 0, 0}, x_n[3] = {0, 0, 0};
+        int x_k2[3] = {0, 0, 0}, x_k[3] = {0, 0, 0}, x_n[3] = {0, 0, 0};   // x_k2: each part's bitrate as 2 K
         std::vector<int> x_shard;
         std::vector<uint64_t> x_off;
         size_t x_piece(int r, int j) const {
-            return j == 0 ? (size_t) x_k[r] * (size_t) x_n[r] * (size_t) x_K[r] / 8
+            return j == 0 ? (size_t) x_k[r] * (size_t) x_n[r] * (size_t) x_k2[r] / 16
                           : 2 * (size_t) (j == 1 ? x_k[r] : x_n[r]);
         }
         size_t x_part(int r) const { return x_piece(r, 0) + x_piece(r, 1) + x_piece(r, 2); }
@@ -537,6 +560,8 @@ public:
     bool fast_setup_finish(std::string& err);
     bool dual_prefill_ready();   // STRATA_GLM_DUAL_PREFILL (glm_prefill.cu)
     int dual_pf_state_ = 0;      // 0 not tried, 1 on, -1 off
+    bool calc_prefill_ready();   // STRATA_GLM_PREFILL_CALC (glm_prefill.cu)
+    int calc_pf_state_ = 0;      // 0 not tried, 1 on, -1 off
     void ram_left_check() const;
     void fast_destroy();
     bool forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err);
@@ -556,7 +581,14 @@ public:
         float* ffn;
     };
     bool fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, const float* const* ah_bias, bool& pf_pending,
-                          std::string& err);
+                          std::string& err, bool rows = false);   // rows: a batched step's row (STRATA_GLM_SKIP_EMPTY)
+    // ... its route (moe_route with the token path's settings) into md's plan, the shared expert's h to sh_hq; win /
+    // win_n / win_rows: a grouped batched step's row and rows (glm_rows.cu)
+    void fast_moe_route(int il, const MoeIo& io, const strata::kernels::glmf::MoeDev& md, void* sh_hq, bool pred,
+                        int n_ah, const float* const* ah_bias, bool lane, int win = 0, int win_n = 0, int win_rows = 0);
+    // STRATA_GLM_GROUP_EXPERTS: the routed experts of a batched step's n rows, each distinct one once for its rows
+    // (glm_rows.cu); false with err empty: not here (the rows go one by one)
+    bool rows_moe_grouped(int il, int n, std::string& err);
     void fast_service();
     // gate / up / down of one expert from the shards (or its chunk-th of n_chunks pieces)
     void fast_read_part(int il, int e, int role, uint8_t* blob, int chunk = 0, int n_chunks = 1);
@@ -786,6 +818,8 @@ public:
     /// sequence's position advances by one.  n <= rows_max().
     bool rows_ok() const { return rows_ != nullptr && n_parts_ == 1 && split_next_ == nullptr && fast_ != nullptr; }
     static int rows_max();
+    /// STRATA_GLM_SPLIT_ROWS as the scheduler and the parts' setup both take it: 0 (off) .. rows_max()
+    static int split_rows_setting();
     bool multi_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
                     int* tokens_out, std::string& err);
     /// LAYER SPLIT (glm_rows.cu): one token of each of n sequences through every part as one batched step per part,
@@ -883,6 +917,9 @@ public:
     // ---- the batched prompt path (src/core/glm_prefill.cu)
     struct PrefillState;
     PrefillState* pf_ = nullptr;
+    // STRATA_GLM_PREFILL_CALC: this (waiting) part's share of another part's MoE layer, enqueued on this GPU
+    struct CalcJob;
+    bool prefill_calc(const CalcJob& job, std::string& err);
     bool prefill_setup(std::string& err);                  // in fast_setup: sizes, host buffers (no device memory)
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
     size_t prefill_trim_prestage(size_t max_borrow);       // ... at most this many: a smaller prestage buffer (the new bytes)

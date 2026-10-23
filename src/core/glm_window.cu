@@ -291,7 +291,7 @@ bool Glm5Model::win_reserve(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     if (!win_alloc(kWinMax, err)) return false;
-    int n_rec = 0;
+    int n_rec = 0;                               // (the repeated layers: the commit's replay buffer below)
     for (int il = l0_; il < l1_; ++il) n_rec += g.is_recr(il);
     const size_t kda_bytes = spec_kda_bytes();   // the same run per recurrent layer that spec_kda_copy saves
     if (kda_bytes > 0 && kda_bak_ == nullptr && cudaMalloc(&kda_bak_, kda_bytes) != cudaSuccess) {
@@ -1081,7 +1081,7 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         err = "glm window: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
-    if (sp != nullptr && !sp->greedy) {
+    if (sp != nullptr && (!sp->greedy || sp->penalty_last_n > 0)) {
         // row t is drawn with the counter the token loop would use for the token after tokens[t] (and, with
         // penalties, the history it would count: tokens[1..t] after what came before)
         tail->pick_tokens(WT.logits, T, *sp, tokens, 0, WT.tok, FT->cs);
@@ -1461,7 +1461,7 @@ bool Glm5Model::win_pipe_begin(int32_t first, std::string& err, const strata::ke
         W.per_token = false;
         W.piped = true;
         W.bank ^= 1;
-        W.pick_sampled = sp != nullptr && !sp->greedy;
+        W.pick_sampled = sp != nullptr && (!sp->greedy || sp->penalty_last_n > 0);   // (penalties: the sampler's pick)
         if (W.pick_sampled) W.pick_sp = *sp;
     }
     // the tokens past a wrong draft skip their heavy kernels (STRATA_GLM_WIN_SKIP=0: they run anyway)

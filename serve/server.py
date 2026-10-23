@@ -3,7 +3,7 @@
     python -m serve.server --engine mock --port 8095            (a scripted engine, for clients and tests)
     python -m serve.server --engine strata --config strata.json --port 8080   (the real engine, resident)
 
-Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
+Endpoints: POST /v1/chat/completions and /v1/responses (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
@@ -51,10 +51,15 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve import ds4_vision, gpu_map  # noqa: E402
 from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            effort_kwargs, effort_level, images_of, literal_tags, mark_literals,
-                            openai_to_messages, unmark_literals)
+                            deepseek_effort_kwargs, deepseek_images, effort_kwargs, effort_level, images_of,
+                            literal_tags, mark_literals, openai_to_messages, unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
-from serve.update import Updater  # noqa: E402
+from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
+                             new_response, response_collect, response_events)
+from serve.response_config import ENV_KEYS as RESPONSE_ENV_KEYS, limits_from_env  # noqa: E402
+from serve.response_jobs import BackgroundJobs, JobError  # noqa: E402
+from serve.response_store import StoreBusy  # noqa: E402
+from serve.update import RESTART_EXIT, Updater  # noqa: E402
 import maya_names  # noqa: E402  (tools/) the settings' names users see (MAYA_*) and the older ones the code reads
 
 try:                        # Project Maya's release (the dashboard's About; the engine's INFO carries none)
@@ -94,8 +99,9 @@ IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
-# token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
-RATE_WINDOW_S = 2.0
+# token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.  5 s: drafted
+# tokens come in bursts of 1-4 a step, and over 2 s the rate swung +-25% around the engine's steady one
+RATE_WINDOW_S = 5.0
 RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean so far, with the span floored here
 
 
@@ -249,6 +255,10 @@ def client_stop_strings(req: dict | None) -> list[str]:
     return [x for x in s if isinstance(x, str) and x][:16] if isinstance(s, list) else []
 
 
+# the penalties' window at most: what the engines count (GLM's and DeepSeek's samplers keep the last 4096 tokens) -
+# a request's penalty_last_n / repeat_last_n of -1 (llama.cpp's "the whole context") asks for this
+PENALTY_WINDOW_MAX = 4096
+
 # a request's sampling fields and their JSON type (True: an integer); llama.cpp's names for two of them
 SAMPLING_TYPES = (("temperature", False), ("top_p", False), ("min_p", False), ("presence_penalty", False),
                   ("frequency_penalty", False), ("repetition_penalty", False), ("top_k", True),
@@ -261,19 +271,21 @@ def check_request_sampling(req: dict) -> None:
     type ("temperature": "warm", "top_k": 40.5, "seed": true) is refused - before, it replaced the configured default
     and the engine line left it out, so the answer was silently greedy.  Ranges behave as before (a temperature <= 0 is
     greedy, top_k 0 or above 64 the widest list, a seed <= 0 none) and an absent or null field is not checked.
-    llama.cpp's repeat_penalty / repeat_last_n are taken as repetition_penalty / penalty_last_n (those win)."""
+    llama.cpp's repeat_penalty / repeat_last_n are taken as repetition_penalty / penalty_last_n (those win); the window
+    means what it means there (penalty_keys): 0 = no penalties, -1 = the whole context, below -1 refused."""
     if not isinstance(req, dict):
         return
     if req.get("repeat_penalty") is not None and req.get("repetition_penalty") is None:
         req["repetition_penalty"] = req["repeat_penalty"]
-    rl = req.get("repeat_last_n")
-    if req.get("penalty_last_n") is None and isinstance(rl, int) and not isinstance(rl, bool) and rl > 0:
-        req["penalty_last_n"] = rl      # 0 and -1 (off / the whole context) keep the engine's default window
+    window_key = "penalty_last_n"
+    if req.get("penalty_last_n") is None and req.get("repeat_last_n") is not None:
+        req["penalty_last_n"] = req["repeat_last_n"]
+        window_key = "repeat_last_n"
     for key, integer in SAMPLING_TYPES:
         value = req.get(key)
         if value is None:
             continue
-        what = f"{key}: {'an integer' if integer else 'a number'}"
+        what = f"{window_key if key == 'penalty_last_n' else key}: {'an integer' if integer else 'a number'}"
         if isinstance(value, str) and value.strip():
             try:
                 num = float(value)
@@ -290,6 +302,8 @@ def check_request_sampling(req: dict) -> None:
             req[key] = value = num
         if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
             raise ValueError(what)
+    if isinstance(req.get("penalty_last_n"), int) and req["penalty_last_n"] < -1:
+        raise ValueError(f"{window_key}: -1 (the whole context), 0 (no penalties) or a positive number of tokens")
 
 
 def logit_bias_of(value, vocab_size: int | None = None) -> dict[int, float]:
@@ -641,6 +655,25 @@ class StrataEngine:
         self.__init__(*self.spawn)
         self.info = {**info, **self.info}
 
+    @property
+    def last(self) -> dict:
+        """The last DONE's figures.  With several conversations at once (multi), the figures of the request this thread
+        runs (#310): requests decoded together finish within a step of each other, and one shared field let a request
+        report another's timings and cached tokens.  Each request thread has its own (an empty one until its DONE)."""
+        if self.multi:
+            t = self._tls
+            if not hasattr(t, "last"):
+                t.last = {}
+            return t.last
+        return self._last
+
+    @last.setter
+    def last(self, v: dict):
+        if self.multi:
+            self._tls.last = v
+        else:
+            self._last = v
+
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
@@ -765,8 +798,12 @@ class StrataEngine:
     def penalty_keys(sampling: dict) -> str:
         """The repetition / frequency / presence penalties (llama.cpp's repeat_penalty and repeat_last_n are read as
         repetition_penalty and penalty_last_n): only the ones that change something, and their window with them.  ""
-        when none does - the GEN line is then the one it was without them."""
+        when none does - the GEN line is then the one it was without them.  The window as llama.cpp's: none given = the
+        last 64 tokens, 0 = no penalties, -1 = the whole context - the engines count at most PENALTY_WINDOW_MAX."""
         keys = ""
+        pln = sampling.get("penalty_last_n")
+        if isinstance(pln, int) and not isinstance(pln, bool) and pln == 0:
+            return keys
         rp = sampling.get("repetition_penalty")
         rp_on = isinstance(rp, (int, float)) and float(rp) != 1.0
         pf = sampling.get("frequency_penalty")
@@ -781,9 +818,10 @@ class StrataEngine:
             keys += f" penalty_present={float(pp)!r}"
         if rp_on or pf_on or pp_on:
             # a penalty without a window counts over nothing: the engine's default is the last 64 tokens
-            pln = sampling.get("penalty_last_n")
             if isinstance(pln, int) and not isinstance(pln, bool) and pln > 0:
                 keys += f" penalty_last_n={pln}"
+            elif pln == -1 and not isinstance(pln, bool):
+                keys += f" penalty_last_n={PENALTY_WINDOW_MAX}"
             else:
                 keys += " penalty_last_n=64"
         return keys
@@ -1363,12 +1401,17 @@ class Service:
         self.stopping = False            # the server is ending: a request still queued is refused, not started
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        self.response_limits = limits_from_env()
+        self.responses = ResponseStore.from_limits(self.response_limits)
+        self.response_jobs = BackgroundJobs(self.responses, self.response_limits)
         # pages on OTHER origins allowed to call /v1/* from a browser (CORS; the config's "cors_origins"): exact origins
         # like "http://127.0.0.1:8090", or "*" for every page.  Empty = no CORS headers at all.
         self.cors_origins: list[str] = []
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
         self.active = 0                                 # requests with the engine now (several: READY multi=<n>)
-        self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
+        # (time, generated) samples for the live tok/s window: enough for all of RATE_WINDOW_S at any speed (32 held
+        # well under a second at 40 tok/s, and the rate then followed the last few bursts of drafted tokens)
+        self.rate = collections.deque(maxlen=4096)
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
@@ -1477,7 +1520,7 @@ class Service:
 
     def close_for_restart(self):
         """Before the server ends for an update: the engine, the pictures encoder and the MCP servers stop first."""
-        for part in (self.engine, self.vision, self.mcp):
+        for part in (self.response_jobs, self.engine, self.vision, self.mcp):
             try:
                 if part is not None and hasattr(part, "close"):
                     part.close()
@@ -1628,6 +1671,68 @@ class Service:
             os.replace(tmp, p)
         except (OSError, ValueError) as e:
             print(f"[maya] could not save the new context in {self.config_path}: {e}", flush=True)
+
+    def port_info(self) -> dict:
+        """The dashboard's Port: where the server listens, and whether a new port can apply at once (maya.py started
+        this server and starts it again on the saved port) or only from the next start."""
+        host, port = getattr(self, "listen", None) or ("127.0.0.1", None)
+        return {"port": port, "host": host, "restarts": bool(os.environ.get("MAYA_RESTART_ON_UPDATE")),
+                "saved": bool(self.config_path), "restarting": getattr(self, "port_restart", None)}
+
+    def set_port(self, n: int) -> dict:
+        """The dashboard's Port: n saved into the run config (and Maya's start scripts for it), then - when maya.py
+        started this server - the server ends with RESTART_EXIT after the request in flight, and maya.py starts it again
+        on n.  The port must be free on this server's address now (a busy one: an error, nothing saved)."""
+        host, port = getattr(self, "listen", None) or ("127.0.0.1", None)
+        if not 1024 <= n <= 65535:
+            raise ValueError("the port must be a number from 1024 to 65535")
+        if n == port:
+            raise ValueError(f"Maya listens on {n} already")
+        if not self.config_path:
+            raise ValueError("this server runs without a config, so a port cannot be saved: start it with --port")
+        if getattr(self, "port_restart", None):
+            raise ValueError("Maya is already moving to another port")
+        import socket
+        try:
+            with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind((host, n))
+        except OSError as e:
+            raise ValueError(f"port {n} is in use or not allowed here ({e.strerror or e})") from None
+        self._save_port(n)
+        restarts = bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))
+        if restarts:
+            self.port_restart = n
+            threading.Thread(target=self._restart_on_port, args=(n,), daemon=True).start()
+        print(f"[maya] the port {n} is saved" + (": Maya starts again on it" if restarts else
+              " - it applies from the next start"), flush=True)
+        return {"port": n, "restarts": restarts}
+
+    def _restart_on_port(self, n: int):
+        time.sleep(0.5)                                  # (the answer to the page goes out first)
+        with self.fifo:                                  # the request in flight finishes first
+            print(f"[maya] starting again on port {n} ...", flush=True)
+            self.close_for_restart()
+            os._exit(RESTART_EXIT)
+
+    def _save_port(self, n: int):
+        """"port" in the run config, and --port in Maya's start scripts beside it that start this config (setup writes
+        run-maya-<model>.bat / .sh with the port then chosen; a script would otherwise move it back)."""
+        p = Path(self.config_path)
+        cfg = json.loads(p.read_text(encoding="utf-8-sig"))
+        cfg["port"] = int(n)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        os.replace(tmp, p)
+        for script in list(p.parent.glob("run-*.bat")) + list(p.parent.glob("run-*.sh")):
+            try:
+                raw = script.read_bytes()                # (bytes: a .bat keeps its CR LF line ends)
+                if p.name.encode() not in raw:
+                    continue
+                new = re.sub(rb"(--port\s+)\d+", lambda m: m.group(1) + str(int(n)).encode(), raw)
+                if new != raw:
+                    script.write_bytes(new)
+            except OSError as e:
+                print(f"[maya] could not change the port in {script.name}: {e}", flush=True)
 
     def storage(self) -> dict | None:
         """The model's folder and the free space on its drive (About)."""
@@ -1861,6 +1966,11 @@ class Service:
                 continue
             rows.append((f"maya:engine_{k}", "gauge",
                          self.PROM_STAT.get(k, f"The engine's {k}, from its STAT line"), v))
+        for category, values in (("cache", self.responses.stats()), ("jobs", self.response_jobs.stats())):
+            gauges = {"entries", "blocks", "bytes", "inflight_bytes", "peak_inflight_bytes", "max_entries",
+                      "max_bytes", "ttl_s", "records", "running", "queued", "event_bytes", "readers"}
+            rows += [(f"maya:responses_{category}_{key}", "gauge" if key in gauges else "counter",
+                      f"Responses {category} {key}", value) for key, value in values.items()]
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
 
@@ -1888,7 +1998,10 @@ class Service:
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
             "concurrency": {"serving": places, "requested": places},   # more than that wait their turn
-            "dialects": ["/v1/chat/completions", "/v1/messages"],
+            "dialects": ["/v1/chat/completions", "/v1/responses", "/v1/messages"],
+            "responses": {"cache": self.responses.stats(), "jobs": self.response_jobs.stats(),
+                          "structured_outputs": {"mode": "validate-before-publish", "schema_draft": "2020-12",
+                                                 "constrained_decoding": False}},
             "vision": {"enabled": images, "available": images,
                        "error": None if images or (getattr(self.engine, "info", {}) or {}).get("vision") != "off"
                        else "the model's vision tower did not load (the server's log says why)"},
@@ -1909,7 +2022,7 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
         starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run()."""
@@ -1918,7 +2031,8 @@ class Service:
         if force is not None and tools:
             kwargs["enable_thinking"] = False
         if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
-            kwargs = {**kwargs, **effort_kwargs(self.default_effort)}   # the run config's thinking level
+            kwargs = {**kwargs, **(deepseek_effort_kwargs(self.default_effort) if getattr(self.template, "deepseek", False)
+                                  else effort_kwargs(self.default_effort))}   # the run config's thinking level
         prefill = ""
         if force is not None and tools:
             # GLM's form opens with the tool's name, Qwen's with <function=NAME>, DeepSeek's DSML with its calls block
@@ -1930,11 +2044,17 @@ class Service:
         given["_prefill"] = prefill
         ids = self.render_ids(messages, tools, kwargs, prefill)
         self.embeddings.path = None
-        images = images_of(messages)
+        images = deepseek_images(messages) if getattr(self.template, "deepseek", False) else images_of(messages)
         if images and isinstance(self.vision, ds4_vision.Vision):
             # DeepSeek: the engine encodes the pictures itself; each placeholder the template wrote (user text's are
             # plain text, see render_ids) becomes its picture's span, the resized pixels go in the GENI file
-            pics = [self.vision.picture(src) for src in images]
+            pics = []
+            for src in images:
+                if cancel is not None and cancel.is_set():
+                    raise ValueError("image preparation was cancelled")
+                pics.append(self.vision.picture(src))
+            if cancel is not None and cancel.is_set():
+                raise ValueError("image preparation was cancelled")
             ids, starts = self.vision.expand(ids, pics)
             self.embeddings.path = self.vision.write(self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.dsi", pics,
                                                      starts)
@@ -1952,10 +2072,18 @@ class Service:
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
-            with self.fifo:
+            with self._turn([False, False], cancel, units=None):
+                if cancel is not None and cancel.is_set():
+                    raise ValueError("image preparation was cancelled")
                 self.ensure_engine()                     # (the encoder borrows the engine's memory: it must run)
                 with self.vision.active():
-                    encoded = [self.vision.encode(src) for src in images]
+                    encoded = []
+                    for src in images:
+                        if cancel is not None and cancel.is_set():
+                            raise ValueError("image preparation was cancelled")
+                        encoded.append(self.vision.encode(src))
+                if cancel is not None and cancel.is_set():
+                    raise ValueError("image preparation was cancelled")
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -1994,14 +2122,15 @@ class Service:
         """POST /api/tokens: how many tokens this chat request's prompt takes - the same template, thinking level,
         tools and tokenizer as prepare(), with nothing run (no image encoder: a picture counts as its marker, so the
         count is approximate then).  The web app's context meter."""
-        messages, tools, kw = openai_to_messages(req)
+        messages, tools, kw = openai_to_messages(req, deepseek=getattr(self.template, "deepseek", False))
         kw = {k: v for k, v in kw.items() if k != "_force_tool"}
         if req.get("strata_mcp") is True and self.mcp is not None:
             own = {t.get("name") for t in tools or []}
             tools = (tools or []) + self.mcp.template_tools(exclude=own) or None
         if self.default_effort and "reasoning_effort" not in kw and "enable_thinking" not in kw:
-            kw = {**kw, **effort_kwargs(self.default_effort)}
-        sources = images_of(messages)
+            kw = {**kw, **(deepseek_effort_kwargs(self.default_effort) if getattr(self.template, "deepseek", False)
+                                  else effort_kwargs(self.default_effort))}
+        sources = deepseek_images(messages) if getattr(self.template, "deepseek", False) else images_of(messages)
         n, approximate = len(self.render_ids(messages, tools, kw)), len(sources) > 0
         if sources and isinstance(self.vision, ds4_vision.Vision):   # (DeepSeek: a picture's span is its resize's)
             try:
@@ -2049,16 +2178,26 @@ class Service:
         return now
 
     @contextlib.contextmanager
-    def _turn(self, hold):
+    def _turn(self, hold, cancel=None, units=1):
         """The engine's turn for one request: the FIFO, given back at the end unless a fair slice already did."""
-        self.fifo.acquire(units=1)
-        hold[0] = True
+        place = None
+        if cancel is None:
+            self.fifo.acquire(units=units)
+            hold[0] = True
+        else:
+            place = self.fifo.enqueue(units=units)
+            while not cancel.is_set():
+                if self.fifo.wait_turn(place, timeout=0.05):
+                    hold[0] = True
+                    break
         try:
             yield
         finally:
+            if place is not None:
+                self.fifo.leave(place)
             if hold[0]:
                 hold[0] = False
-                self.fifo.release(units=1)
+                self.fifo.release(units=units)
 
     def _sliced(self, ids, max_new, sampling, cancel, emb, hold) -> Iterator[int | None]:
         """engine.generate(), in fair slices (STRATA_FAIR_SLICE_S): once this answer has been decoding that long and
@@ -2117,7 +2256,9 @@ class Service:
             print(f"[maya] fair slice: {len(produced)} tokens written, the engine goes to the next request "
                   f"({waiting} waiting); this one continues after it", flush=True)
             try:
-                while not self.fifo.wait_turn(place, timeout=10):
+                while not self.fifo.wait_turn(place, timeout=0.1):
+                    if cancel.is_set() or self.stopping:
+                        return
                     yield None                          # keeps the client's watchdog calm while queued again
                 hold[0] = True
             finally:
@@ -2160,11 +2301,15 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        responses = (sampling or {}).get("_responses") is True
+        single_tool = responses and (sampling or {}).get("parallel_tool_calls") is False
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
-                              dsml=getattr(self.template, "deepseek", False))
+                              dsml=getattr(self.template, "deepseek", False),
+                              strict_tools=responses, single_tool=single_tool)
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        reasoning_tokens = 0
         held = ""                                       # text that may be the start of a stop marker (stop_texts)
         # the client's own stop strings (OpenAI "stop", Anthropic "stop_sequences"): the answer ends before one.  They
         # apply to the answer, not inside the reasoning; the model's own end-of-turn markers apply everywhere
@@ -2181,9 +2326,12 @@ class Service:
             self.status["queued"] += 1
         hold = [False, False]                           # holds the FIFO (fair slices let go of it); counts as active
         try:
-            with self._turn(hold):
+            with self._turn(hold, cancel):
                 with self.status_lock:
                     self.status["queued"] -= 1
+                if cancel.is_set():
+                    yield "done", {"finish": "cancel", "completion_tokens": 0}
+                    return
                 if self.stopping:
                     raise ValueError("the server is stopping: send the request again once the model is back")
                 if self.vision is not None and self.vision.owed:   # memory an encode borrowed, not back yet
@@ -2253,6 +2401,8 @@ class Service:
                             finish = "stop"
                             raw_ids.append(t)
                             break
+                        if parser.state == "reasoning":
+                            reasoning_tokens += 1
                         raw_ids.append(t)
                         text, stopped = detok.push(t), False
                         stops = self.stop_texts + (client_stops if parser.state != "reasoning" else [])
@@ -2272,6 +2422,9 @@ class Service:
                         last_print = self._progress(last_print)
                         for ev in evs:
                             yield "event", ev
+                            if single_tool and ev.kind == "tool_call" and ev.complete:
+                                stopped = True
+                                break
                         if stopped:
                             finish = "stop"
                             break
@@ -2361,7 +2514,8 @@ class Service:
                 self.status["busy"] = self.active > 0
         for ev in parser.finish():
             yield "event", ev
-        yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
+        yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
+                       "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings, "stop_sequence": matched if finish == "stop" else None}
 
 
@@ -2480,10 +2634,13 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
-        messages.append({"role": "assistant", "content": "".join(text).strip(),
-                         **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
-                         "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
-        messages += [{"role": "tool", "content": r} for r in results]
+        deepseek = getattr(svc.template, "deepseek", False)
+        messages.append({"role": "assistant", "content": "".join(text) if deepseek else "".join(text).strip(),
+                         **({"reasoning_content": "".join(reasoning) if deepseek else "".join(reasoning).strip()}
+                            if reasoning else {}),
+                         "tool_calls": [{"id": c.id, "function": {"name": c.name, "arguments": c.arguments}}
+                                        for c in calls]})
+        messages += [{"role": "tool", "tool_call_id": c.id, "content": r} for c, r in zip(calls, results)]
         # a required tool call applies to the first answer only: after the tools ran, the model answers freely
         kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill")}
         sampling = {k: v for k, v in (sampling or {}).items() if k != "_prefill"}
@@ -2558,16 +2715,13 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             elif ev.kind == "tool_start":
                 streamed[ev.call.id] = calls
                 calls += 1
-                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "id": ev.call.id, "type": "function",
-                                             "function": {"name": ev.call.name, "arguments": ""}}]})
+                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], **ev.call.to_openai(arguments="")}]})
             elif ev.kind == "tool_args":
                 yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "function": {"arguments": ev.text}}]})
             elif ev.kind == "tool_call" and ev.call.id in streamed:
                 continue
             elif ev.kind == "tool_call":
-                yield chunk({"tool_calls": [{"index": calls, "id": ev.call.id, "type": "function",
-                                             "function": {"name": ev.call.name,
-                                                          "arguments": json.dumps(ev.call.arguments, ensure_ascii=False)}}]})
+                yield chunk({"tool_calls": [{"index": calls, **ev.call.to_openai()}]})
                 calls += 1
         else:
             if held:
@@ -2590,6 +2744,34 @@ def carry_embeddings(local, path, chunks):
     in the prompt then went to the engine as plain pad tokens and the model answered about a black / blank picture."""
     local.path = path                                  # runs on the thread that first pulls from the generator
     yield from chunks
+
+
+def watch_client(handler, cancel: threading.Event, every: float = 0.5) -> None:
+    """A request's client watched on its own thread (#314): an API request writes nothing while it waits in the queue,
+    and a non-streamed one nothing until its answer is done, so a client that timed out or went away was only noticed
+    at its first write - queued requests nobody waited for any more piled up for hours, and each then ran its whole
+    answer.  A connection the client closed (or reset) reads as end-of-file: `cancel` is set, the request leaves the
+    queue (or its engine work stops).  Data the client sent meanwhile (its next request on a kept-alive connection) is
+    not an end.  The watch ends with the request's cancel, the connection, or the next request on that connection
+    (one watch a connection)."""
+    import select
+    import socket
+    conn, token = handler.connection, object()
+    handler._client_watch = token
+
+    def watch():
+        while not cancel.wait(every) and getattr(handler, "_client_watch", None) is token:
+            try:
+                ready, _, _ = select.select([conn], [], [], 0)
+                if ready and conn.recv(1, socket.MSG_PEEK) == b"":
+                    cancel.set()
+                    return
+            except ConnectionError:                     # (reset by the client: gone)
+                cancel.set()
+                return
+            except (OSError, ValueError):               # (closed by this server: the request is done)
+                return
+    threading.Thread(target=watch, name="client-watch", daemon=True).start()
 
 
 class StreamJob:
@@ -2685,6 +2867,8 @@ def openai_collect(chunks) -> dict:
             cur = by_index.setdefault(tc.get("index", len(by_index)), {"id": None, "type": "function",
                                                                         "function": {"name": "", "arguments": ""}})
             cur["id"] = tc.get("id") or cur["id"]
+            if tc.get("namespace") is not None:
+                cur["namespace"] = tc["namespace"]
             fn = tc.get("function") or {}
             cur["function"]["name"] += fn.get("name") or ""
             cur["function"]["arguments"] += fn.get("arguments") or ""
@@ -2933,7 +3117,7 @@ def make_handler(svc: Service):
             allow = self._cors_allow()
             self.send_response(204 if allow else 403)
             if allow:
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
                 asked = self.headers.get("Access-Control-Request-Headers")
                 self.send_header("Access-Control-Allow-Headers", asked or "Content-Type, Authorization, x-api-key")
                 self.send_header("Access-Control-Max-Age", "600")
@@ -2950,8 +3134,119 @@ def make_handler(svc: Service):
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
 
+        def _response_owner(self):
+            if not svc.api_key:
+                return "public"
+            auth = self.headers.get("Authorization", "")
+            given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+            return hashlib.sha256(given.encode()).hexdigest()
+
+        def _response_lookup(self, owner, response_id):
+            try:
+                return svc.response_jobs.get(owner, response_id)
+            except KeyError:
+                return svc.responses.get(owner, response_id)
+
+        def _background_stream(self, owner, response_id, after=-1):
+            try:
+                svc.response_jobs.check_cursor(owner, response_id, after)
+            except KeyError:
+                raise JobError(409, "background event history is no longer retained") from None
+            with svc.response_jobs.reader(owner, response_id, after) as events:
+                self._write_background_stream(events, after)
+
+        def _write_background_stream(self, events, after):
+            self.connection.settimeout(svc.response_limits["STREAM_TIMEOUT_S"])
+            self._sse()
+            try:
+                for item in events:
+                    if item is None:
+                        self.wfile.write(b": keep-alive\n\n")
+                    else:
+                        name, payload = item
+                        after = payload["sequence_number"]
+                        self.wfile.write(f"event: {name}\n".encode() + b"data: " +
+                                         json.dumps(payload, ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.flush()
+            except (JobError, KeyError) as exc:
+                payload = {"type": "error", "code": "event_history_unavailable", "param": None,
+                           "message": str(exc), "sequence_number": after + 1}
+                try:
+                    self.wfile.write(b"event: error\ndata: " + json.dumps(payload).encode() + b"\n\n")
+                except OSError:
+                    pass
+            except OSError:
+                pass
+            finally:
+                events.close()
+
+        def _response_resource(self, delete=False):
+            if not self._authorized():
+                return
+            parts = self.path.split("?")[0].rstrip("/").removeprefix("/v1/responses/").split("/")
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if len(parts) > 2 or (len(parts) == 2 and (parts[1] != "input_items" or delete)):
+                return self._json(404, {"error": {"message": "not found"}})
+            try:
+                owner = self._response_owner()
+                if delete:
+                    if query:
+                        raise ValueError("response deletion does not support query options")
+                    removed = False
+                    for store in (svc.response_jobs, svc.responses):
+                        try:
+                            store.delete(owner, parts[0])
+                            removed = True
+                        except KeyError:
+                            pass
+                    if not removed:
+                        raise KeyError(parts[0])
+                    return self._json(200, {"id": parts[0], "object": "response.deleted", "deleted": True})
+                stored = self._response_lookup(owner, parts[0])
+                if len(parts) == 1 and query:
+                    if (set(query) - {"stream", "starting_after"} or query.get("stream") != ["true"] or
+                            any(len(value) != 1 for value in query.values())):
+                        raise ValueError("retrieve accepts stream=true and optional starting_after")
+                    after = int(query["starting_after"][0]) if "starting_after" in query else -1
+                    if "starting_after" in query and after < 0:
+                        raise ValueError("starting_after must be nonnegative")
+                    return self._background_stream(owner, parts[0], after)
+                result = input_page(stored["input"], query) if len(parts) == 2 else stored["response"]
+                self._json(200, result)
+            except KeyError:
+                self._json(404, {"error": {"type": "invalid_request_error", "message": "stored response not found"}})
+            except (JobError, StoreBusy) as exc:
+                self._json(getattr(exc, "status", 503), {"error": {"type": "server_error", "message": str(exc)}})
+            except ValueError as exc:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(exc)}})
+
+        def _response_cancel(self, path):
+            parts = path.removeprefix("/v1/responses/").split("/")
+            if len(parts) != 2 or parts[1] != "cancel" or "?" in self.path:
+                return self._json(404, {"error": {"message": "not found"}})
+            owner = self._response_owner()
+            try:
+                out = svc.response_jobs.cancel(owner, parts[0])
+            except KeyError:
+                try:
+                    out = self._response_lookup(owner, parts[0])["response"]
+                except KeyError:
+                    return self._json(404, {"error": {"message": "background response not found"}})
+                if not out.get("background"):
+                    raise ValueError("only background responses can be cancelled")
+            self._json(200, out)
+
+        def do_DELETE(self):
+            if self.path.split("?")[0].startswith("/v1/responses/"):
+                self._response_resource(delete=True)
+            elif self._authorized():
+                self._json(404, {"error": {"message": "not found"}})
+
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/v1/responses/"):
+                self._response_resource()
+                return
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
                 name = path[len("/fonts/"):]
@@ -3029,6 +3324,10 @@ def make_handler(svc: Service):
                 # the dashboard's Context size: the range, the measured cost of the current size, a reload's state
                 if self._authorized():
                     self._json(200, svc.context_limits())
+            elif path == "/api/port":
+                # the dashboard's Port: where the server listens, and whether a new one applies at once
+                if self._authorized():
+                    self._json(200, svc.port_info())
             elif path == "/api/update":
                 # About > Updates: the latest release (GitHub, cached six hours; ?force=1 asks now) and whether this
                 # folder can update itself
@@ -3092,6 +3391,9 @@ def make_handler(svc: Service):
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             try:
+                if path.startswith("/v1/responses/") and path.endswith("/cancel"):
+                    self._response_cancel(path)
+                    return
                 if path == "/settings":
                     self._settings()
                     return
@@ -3100,6 +3402,9 @@ def make_handler(svc: Service):
                     return
                 if path == "/api/context":
                     self._context()
+                    return
+                if path == "/api/port":
+                    self._port()
                     return
                 if path == "/api/update":
                     self._update()
@@ -3110,7 +3415,7 @@ def make_handler(svc: Service):
                 if path == "/api/tokens":                    # the context meter: a prompt's size, nothing run
                     self._json(200, svc.count_tokens(req))
                     return
-                if path in ("/v1/chat/completions", "/v1/messages") and (svc.reloading() or svc.updater.busy()):
+                if path in ("/v1/chat/completions", "/v1/responses", "/v1/messages") and (svc.reloading() or svc.updater.busy()):
                     # a context change is reloading the model, or Maya is updating: say so, and when to try again
                     why = ("Strata-DeepSeek is updating and starts again in a few minutes" if svc.updater.busy() else
                            "the model is reloading with a new context size; try again in a minute")
@@ -3124,12 +3429,16 @@ def make_handler(svc: Service):
                     return
                 if path == "/v1/chat/completions":
                     self._openai(req)
+                elif path == "/v1/responses":
+                    self._responses(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except BadBody as e:
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except (JobError, StoreBusy) as e:
+                self._json(getattr(e, "status", 503), {"error": {"type": "server_error", "message": str(e)}})
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
@@ -3193,6 +3502,20 @@ def make_handler(svc: Service):
                 return
             self._json(202, {"reload": reload})
 
+        def _port(self):
+            # It moves the server for every client, so only the app's own page may ask for it
+            body = self._body()
+            if not self._own_page("the port can be changed"):
+                return
+            try:
+                req = json.loads(body or b"{}")
+                n = int(req.get("port")) if isinstance(req, dict) else 0
+                out = svc.set_port(n)
+            except (TypeError, ValueError, OSError) as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            self._json(202, out)
+
         def _update(self):
             # It replaces the server's files and restarts it for every client: only the app's own page
             self._body()
@@ -3226,11 +3549,97 @@ def make_handler(svc: Service):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
 
+        def _responses(self, req):
+            owner = self._response_owner()
+            try:
+                previous = req.get("previous_response_id")
+                if previous is not None:
+                    if not isinstance(previous, str) or not previous:
+                        raise ValueError("previous_response_id must be a nonempty string")
+                    stored = self._response_lookup(owner, previous)
+                    if stored["response"]["status"] not in ("completed", "incomplete"):
+                        raise JobError(409, "previous response is not a completed or incomplete generation")
+                    added = req.get("input", [])
+                    if isinstance(added, str):
+                        added = [{"role": "user", "content": added}]
+                    if not isinstance(added, list):
+                        raise ValueError("input must be a string or array of input items")
+                    req = {**req, "input": stored["input"] + stored["response"]["output"] + added}
+            except KeyError:
+                return self._json(404, {"error": {"type": "invalid_request_error",
+                                                 "message": "previous_response_id: stored response not found"}})
+            sampling = normalize_request(req)
+            validation = sampling.pop("_response_validation")
+            history = input_items(req["input"]) if req.get("store") else None
+            sampling = svc.with_shared(sampling, "openai")
+            sampling["_api"] = "openai"
+            sampling["_responses"] = True
+            svc.check_request(sampling)
+            if req.get("background"):
+                initial = new_response(svc.model, req, status="queued")
+                work = lambda cancel, rid: self._response_work(req, sampling, history, validation, owner, cancel, rid, False)
+                svc.response_jobs.store = svc.responses
+                out = svc.response_jobs.submit(owner, initial, history, work)
+                if req.get("stream"):
+                    return self._background_stream(owner, out["id"])
+                return self._json(200, out)
+            cancel = threading.Event()
+            watch_client(self, cancel)
+            events = self._response_work(req, sampling, history, validation, owner, cancel)
+            try:
+                if not req.get("stream"):
+                    out = response_collect(events)
+                    return self._json(500 if out["status"] == "failed" else 200, out)
+                first = next(events)
+                self._sse()
+                for item in itertools.chain([first], events):
+                    if item is None:
+                        self.wfile.write(b": keep-alive\n\n")
+                    else:
+                        name, data = item
+                        self.wfile.write(f"event: {name}\n".encode() + b"data: " +
+                                         json.dumps(data, ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.flush()
+            except OSError:
+                cancel.set()
+                if not self.answer_started:
+                    self._json(500, {"error": {"type": "server_error", "message": "could not prepare the response"}})
+            finally:
+                events.close()
+
+        def _response_work(self, req, sampling, history, validation, owner, cancel, response_id=None, persist=True):
+            sampling = dict(sampling)
+            # Shared thinking defaults must be resolved by the same normalizer as request values.
+            messages, tools, kw = openai_to_messages(sampling)
+            max_new = int(sampling.get("max_completion_tokens") or sampling.get("max_tokens") or 0)
+            events = None
+            svc.embeddings.path = None
+            try:
+                if cancel.is_set():
+                    raise ValueError("generation was cancelled before preparation")
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
+                if kw.get("_prefill"):
+                    sampling["_prefill"] = kw["_prefill"]
+                effective = {**svc.sampling_defaults, **svc.shared, **sampling}
+                config = {**req, **{k: effective[k] for k in ("temperature", "top_p") if k in effective}}
+                run = svc.run(ids, thinking, tools, max_new, sampling, cancel)
+                save = (lambda out: svc.responses.put(owner, out, history)) if req.get("store") and persist else None
+                events = response_events(svc.model, config, run, len(ids), persist=save, response_id=response_id,
+                                         validation=validation, cancel=cancel)
+                yield from events
+            finally:
+                if events is not None:
+                    events.close()
+                # A disconnect before the generator starts, or failed preparation, cannot run Service.run's cleanup.
+                emb = getattr(svc.embeddings, "path", None)
+                if emb:
+                    Path(emb).unlink(missing_ok=True)
+
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             req["_api"] = "web" if req.get("strata_resume") is True else "openai"   # the Monitor's request table
             svc.check_request(req)                             # a bad sampling field or logit_bias: a 400, now
-            messages, tools, kw = openai_to_messages(req)
+            messages, tools, kw = openai_to_messages(req, deepseek=getattr(svc.template, "deepseek", False))
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or []}
@@ -3246,6 +3655,8 @@ def make_handler(svc: Service):
                 req = {**req, "_prefill": kw["_prefill"]}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
+            if not (req.get("stream") and req.get("strata_resume") is True):   # (the web app's runs on, by design)
+                watch_client(self, cancel)
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
@@ -3330,13 +3741,14 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "anthropic")
             req["_api"] = "anthropic"
             svc.check_request(req)                             # a bad sampling field: a 400, now
-            messages, tools, kw = anthropic_to_messages(req)
+            messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(svc.template, "deepseek", False))
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
+            watch_client(self, cancel)
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
@@ -3372,12 +3784,20 @@ class Server(ThreadingHTTPServer):
     # (STRATA_HTTP_BACKLOG overrides it)
     request_queue_size = _backlog()
 
+    def server_close(self):
+        service = getattr(self, "response_service", None)
+        try:
+            if service is not None:
+                service.response_jobs.close()
+        finally:
+            super().server_close()
+
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
             super().handle_error(request, client_address)
 
 
-SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S")
+SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S") + RESPONSE_ENV_KEYS
 
 
 def apply_server_env(cfg: dict) -> None:
@@ -3434,6 +3854,8 @@ def lan_addresses() -> list[str]:
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
+    svc.listen = (host, httpd.server_address[1])         # (the dashboard's Port setting starts from it)
+    httpd.response_service = svc
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 
@@ -3523,8 +3945,9 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
                 raise SystemExit(f"[maya] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
             out[key] = float(value)
         elif key == "penalty_last_n":
-            if not number or value != int(value) or value < 0:
-                raise SystemExit(f"[maya] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
+            if not number or value != int(value) or value < -1:
+                raise SystemExit(f"[maya] config sampling.penalty_last_n={value!r}: expected an integer >= -1 (0 = no "
+                                 "penalties, -1 = the whole context)")
             out[key] = int(value)
         elif key == "seed":
             if not number or value != int(value) or value <= 0:
@@ -3538,6 +3961,62 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
         else:
             print(f"[maya] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
     return out
+
+
+def request_stop(stop: threading.Event, why: str) -> None:
+    """The server's stop, once: main() wraps up the request in progress and ends the engine."""
+    if not stop.is_set():
+        stop.set()
+        print(f"[maya] stopping ({why}): the engine ends", flush=True)
+
+
+def stop_signals(stop: threading.Event) -> None:
+    """SIGTERM, SIGINT (Ctrl+C), SIGHUP (the terminal closed) and Windows' SIGBREAK (Ctrl+Break) stop the server
+    (request_stop).  A later one is ignored while it stops - but a second Ctrl+C raises KeyboardInterrupt: at once.  A
+    signal that is ignored (nohup) stays ignored."""
+    import signal
+
+    def on(signum, frame):
+        if stop.is_set():
+            if signum == signal.SIGINT:
+                raise KeyboardInterrupt
+            return
+        request_stop(stop, signal.Signals(signum).name)
+    for name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        try:
+            if sig is not None and signal.getsignal(sig) is not signal.SIG_IGN:
+                signal.signal(sig, on)
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+
+def watch_parent(stop, stdin=None, getppid=None, poll: float = 1.0) -> None:
+    """--parent-pipe: stdin is a pipe from the program that started the server (maya.py), which writes nothing and
+    holds it open while it runs.  Its end - however that program ended: a crash, SIGKILL, Task Manager - closes it,
+    and the EOF stops the server (`stop(why)`) as Ctrl+C does.  On POSIX a new parent process does too (the parent
+    ended and init or a subreaper took the server).  Both watch from threads of their own."""
+    src = stdin if stdin is not None else getattr(sys.stdin, "buffer", None)
+
+    def eof():
+        try:
+            while src.read(1 << 12):
+                pass
+        except (OSError, ValueError):
+            pass
+        stop("the program that started it ended")
+    if src is not None:
+        threading.Thread(target=eof, name="parent-pipe", daemon=True).start()
+    if os.name == "nt" and getppid is None:
+        return
+    getppid = getppid or os.getppid
+    first = getppid()
+
+    def orphan():
+        while getppid() == first:
+            time.sleep(poll)
+        stop("its parent process ended")
+    threading.Thread(target=orphan, name="parent-pid", daemon=True).start()
 
 
 def main() -> int:
@@ -3570,6 +4049,10 @@ def main() -> int:
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
+    ap.add_argument("--parent-pipe", action="store_true",
+                    help="stdin is a pipe from the program that started this server (maya.py), open while it runs: "
+                         "when it closes - that program ended, however it ended - the server stops as on Ctrl+C "
+                         "(on Linux also when its parent process ends)")
     a = ap.parse_args()
     maya_names.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engine read)
     cfg = maya_names.env_in(json.loads(Path(a.config).read_text(encoding="utf-8-sig"))) if a.config else {}   # (a BOM: Notepad)
@@ -3674,9 +4157,9 @@ def main() -> int:
     if getattr(engine, "multi", 0) > 1:                 # n conversations at once: n places in the FIFO
         svc.fifo.set_capacity(engine.multi)
         print(f"[maya] {engine.multi} conversations at once (--parallel)", flush=True)
-    if cfg.get("reasoning_effort"):
+    if cfg.get("reasoning_effort") or (svc.template.deepseek and cfg.get("reasoning_effort") is not None):
         try:
-            effort_kwargs(cfg["reasoning_effort"])
+            (deepseek_effort_kwargs if svc.template.deepseek else effort_kwargs)(cfg["reasoning_effort"])
         except ValueError as e:
             raise SystemExit(f"[maya] config reasoning_effort: {e}")
         svc.default_effort = cfg["reasoning_effort"]
@@ -3730,7 +4213,7 @@ def main() -> int:
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
-    print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
+    print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, /v1/responses, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
     print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
@@ -3752,27 +4235,21 @@ def main() -> int:
     if a.open:
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
-    # SIGTERM (llama-swap's cmdStop, systemd) ends the server as Ctrl+C does: the engine gets QUIT and time to keep its
-    # conversation.  A second SIGTERM while that runs (systemd signals the whole group, then the supervisor again) is
-    # ignored instead of cutting it short.
+    # SIGTERM (llama-swap's cmdStop, systemd), SIGHUP (the terminal closed), Ctrl+C, Windows' Ctrl+Break and - with
+    # --parent-pipe - the end of maya.py (watch_parent) end the server alike: the engine gets QUIT and time to keep its
+    # conversation.  A second signal while that runs (systemd signals the whole group, then the supervisor again) is
+    # ignored instead of cutting it short - except a second Ctrl+C, which ends the server at once (the engine then ends
+    # when its input closes).
     stop = threading.Event()
-
-    def on_term(signum, frame):
-        if stop.is_set():
-            return
-        stop.set()
-        print("[maya] stopping: the engine ends", flush=True)
-        raise KeyboardInterrupt
-
-    if os.name != "nt":
-        import signal
-        signal.signal(signal.SIGTERM, on_term)
+    stop_signals(stop)
+    if a.parent_pipe:
+        watch_parent(lambda why: request_stop(stop, why))
     try:
-        threading.Event().wait()
+        while not stop.wait(0.5):                      # (a timed wait: signal handlers run on Windows too)
+            pass
     except KeyboardInterrupt:
-        stop.set()
-        if os.name != "nt":
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        request_stop(stop, "Ctrl+C")
+    try:
         httpd.shutdown()
         # a request in progress is wrapped up, not dropped: its thinking is closed and it answers, for up to
         # STRATA_ENGINE_WRAP_S seconds (40), so the client still gets an answer and the turn ends; past that it is cut.
@@ -3799,6 +4276,9 @@ def main() -> int:
             vision.close()
         if hub is not None:
             hub.close()
+    except KeyboardInterrupt:                          # a second Ctrl+C: at once
+        print("[maya] stopped at once: the engine ends as its input closes", flush=True)
+        return 130
     return 0
 
 

@@ -1,5 +1,6 @@
-"""tools/test_setup_ds4.py - the setup's two models: GLM-5.3-Flash or DeepSeek-V4.1-Flash-1017 (maya.py) - which one the
-options pick, the DeepSeek download's manifest and URLs, its config (what a setup again keeps) and its start command.
+"""tools/test_setup_ds4.py - the setup's two models: GLM-5.3-Flash or DeepSeek-V4.1-Flash-1017 (maya.py; DeepSeek at 2.9 or
+3.5 bits) - which one the options pick, the DeepSeek downloads' manifests and URLs, the Engram tables shared between the
+quants, its config (what a setup again keeps) and its start command.
 No GPU, no network.
 
     python -m unittest tools.test_setup_ds4 -v
@@ -100,7 +101,7 @@ class Quant35(unittest.TestCase):
                              (e29["files"][n], e29["sha256"][n], e29["sources"][n]))
 
     def test_offered_only_where_exl3_runs(self):
-        """--ds4-quant exl3-3.5, or the menu's row - only on NVIDIA compute capability 8.0+ (not AMD, not a PC whose
+        """--ds4-quant exl3-3.5, or the menu's row - only on NVIDIA compute capability 7.0+ (not AMD, not a PC whose
         GPUs are all older)."""
         self.assertIn("exl3-3.5", maya.DS4_QUANTS)
         def offered(gpus, backend="cuda"):
@@ -113,7 +114,8 @@ class Quant35(unittest.TestCase):
                 maya.choose_ds4_quant(args(backend=backend), {})
             return [r for r in rows if r.startswith("EXL3")]
         self.assertEqual(len(offered([{"arch": 86}, {"arch": 70}])), 2)
-        self.assertEqual(offered([{"arch": 70}, {"arch": 70}]), [])            # (Volta: the GGUFs only)
+        self.assertEqual(len(offered([{"arch": 70}, {"arch": 70}])), 2)       # (Volta: since v1.1.20)
+        self.assertEqual(offered([{"arch": 61}, {"arch": 61}]), [])            # (Pascal: the GGUFs only)
         self.assertEqual(offered([], backend="hip"), [])
         self.assertRegex(offered([{"arch": 89}])[1], r"^EXL3 3\.5 bits \(461 GB\)$")
         self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="exl3-3.5"), {}), "exl3-3.5")
@@ -163,11 +165,21 @@ class Quant35(unittest.TestCase):
             self.assertEqual(json.loads((d / maya.VERIFIED).read_text()), book)
 
 
+GPUS3 = [{"index": i, "name": "RTX 5060 Ti", "vram_gb": 15.9} for i in range(3)]
+
+
+def fake_pc(root: Path) -> list:
+    """The patches of a PC with GPUS3 and a calibration store of its own (root / calibration.json)."""
+    return [patch.object(maya.S, "gpus", return_value=GPUS3), patch.object(maya.S, "cpu_info", return_value=("Xeon",)),
+            patch.object(maya.S, "ram_gb", return_value=183.0), patch.object(maya, "CAL_STORE", root / "cal.json")]
+
+
 class Config(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.patches = [patch.object(maya, "ROOT", self.root), patch.object(maya, "say", lambda *a: None),
-                        patch.object(maya, "ok", lambda *a: None), patch.object(maya, "step", lambda *a: None)]
+                        patch.object(maya, "ok", lambda *a: None), patch.object(maya, "step", lambda *a: None)] + \
+            fake_pc(self.root)
         for p in self.patches:
             p.start()
 
@@ -210,6 +222,26 @@ class Config(unittest.TestCase):
                          ("max", {"temperature": 0.6}, "0.0.0.0", "k"))
         self.assertEqual(c["env"], {"DS4_RING_MB": "800", "DS4_CHUNK_MIN": "256"})
 
+    def tuned(self, tp=8, threads=33):
+        key = maya.hardware_key({"gpu": [0, 1, 2], "args": ["--max-context", "131072"], "installer": {"quant": maya.DS4, "ds4_quant": "exl3"}})
+        maya.CAL_STORE.write_text(json.dumps({key: {"args": {"--tp": tp, "--cpu-threads": threads},
+                                                    "date": "2026-10-19"}}))
+
+    def test_tuned_before_is_used(self):
+        self.tuned()
+        _, c = self.write(args())
+        self.assertEqual(c["args"][-4:], ["--tp", "8", "--cpu-threads", "33"])
+        self.tuned(threads=None)                       # (the engine's own threads: no flag)
+        (self.root / "maya-ds4.json").unlink()         # (a fresh setup: no config before)
+        _, c = self.write(args())
+        self.assertNotIn("--cpu-threads", c["args"])
+
+    def test_the_config_befores_own_wins(self):
+        self.tuned()
+        _, c = self.write(args(), {"args": ["--pack", "/old/maya-ds4", "--max-context", "131072", "--tp", "4"]})
+        a = c["args"]
+        self.assertEqual((a[a.index("--tp") + 1], a[a.index("--cpu-threads") + 1]), ("4", "33"))
+
     def test_gguf_config(self):
         pc = {"gpus": [{"index": 0}]}
         p = maya.write_config_ds4(args(), pc, {}, Path("/m/G/maya-ds4"), 65536, Path("/models"), Path("/m/G"),
@@ -218,6 +250,73 @@ class Config(unittest.TestCase):
         self.assertEqual(c["args"][c["args"].index("--vision") + 1], "off")   # (no vision tower in a GGUF)
         self.assertEqual(c["installer"]["ds4_quant"], "gguf-q8")
         self.assertEqual(maya.config_family(c), "deepseek")
+
+    def test_hip_reserve(self):
+        def reserve(gpu, old=None, **kw):
+            (self.root / "maya-ds4-hip.json").unlink(missing_ok=True)   # (a fresh setup, or the one before: `old`)
+            if old is not None:
+                (self.root / "maya-ds4-hip.json").write_text(json.dumps(old))
+            pc = {"backend": "hip", "gpus": [dict(gpu, index=0)]}
+            p = maya.write_config_ds4(args(**kw), pc, {}, Path("/m/G/maya-ds4"), 65536, Path("/models"), Path("/m/G"),
+                                      "maya-s")
+            a = json.loads(p.read_text())["args"]
+            return a[a.index("--reserve-mib") + 1] if "--reserve-mib" in a else None
+        card = {"arch": "gfx1100", "name": "Radeon RX 7900 XTX", "vram_gb": 24}
+        apu = {"arch": "gfx1151", "name": "Radeon 8060S", "vram_gb": 96}
+        self.assertEqual(reserve(card), "3072")                       # (the desktop allocates beside the engine)
+        with patch.object(maya, "WIN", False):
+            self.assertEqual(reserve(apu), "1024")
+        with patch.object(maya, "WIN", True):
+            self.assertEqual(reserve(apu), "3072")
+        self.assertEqual(reserve(card, vram_reserve_mib=500), "500")  # (asked for)
+        self.assertEqual(reserve(card, {"args": ["--reserve-mib", "2000"]}), "2000")   # (kept)
+        p, c = self.write(args())                                     # (NVIDIA: the engine's own 600)
+        self.assertNotIn("--reserve-mib", c["args"])
+
+
+class Calibrate(unittest.TestCase):
+    """./maya.sh --calibrate on a DeepSeek config: tools/calibrate_ds4_tp.py's result into the config and the store."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.cfg = self.root / "maya-ds4.json"
+        self.cfg.write_text(json.dumps({"exe": str(maya.DS4_EXE), "gpu": [0, 1, 2], "installer": {"family": "deepseek",
+                                        "quant": maya.DS4}, "args": ["--pack", "/m/maya-ds4", "--max-context",
+                                                                     "65536", "--tp", "2", "--cpu-threads", "40"]}))
+        self.patches = [patch.object(maya, "say", lambda *a: None), patch.object(maya, "ok", lambda *a: None),
+                        patch.object(maya, "warn", lambda *a: None)] + fake_pc(self.root)
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    def test_result_saved(self):
+        res = {"args": {"--tp": 8, "--cpu-threads": None},
+               "report": {"tok_s": 151.0, "own_tok_s": 103.0, "prompt_tok_s": 607}}
+        with patch.object(maya, "busy_gpus", return_value=[]), \
+                patch.object(maya.CAL4, "run", return_value=res) as run:
+            self.assertTrue(maya.calibrate_config(self.cfg))   # (a DeepSeek config: calibrate_ds4_tp's tuning)
+        self.assertEqual(run.call_args.args[1], [15.9, 15.9, 15.9])   # (the config's GPUs' memory)
+        c = json.loads(self.cfg.read_text())
+        self.assertEqual(c["args"], ["--pack", "/m/maya-ds4", "--max-context", "65536", "--tp", "8"])
+        self.assertEqual(c["installer"]["calibration"]["tok_s"], 151.0)
+        store = json.loads(maya.CAL_STORE.read_text())
+        self.assertEqual(store[maya.hardware_key(c)]["args"], {"--tp": 8, "--cpu-threads": None})
+
+    def test_busy_gpus(self):
+        with patch.object(maya, "busy_gpus", return_value=[(0, 15000)]), patch.object(maya.CAL4, "run") as run:
+            self.assertFalse(maya.calibrate_config(self.cfg))
+        run.assert_not_called()
+
+    def test_failed_keeps_the_config(self):
+        before = self.cfg.read_text()
+        with patch.object(maya, "busy_gpus", return_value=[]), \
+                patch.object(maya.CAL4, "run", side_effect=RuntimeError("engine exited")):
+            self.assertFalse(maya.calibrate_config(self.cfg))
+        self.assertEqual(self.cfg.read_text(), before)
+        self.assertFalse(maya.CAL_STORE.exists())
 
 
 class Gguf(unittest.TestCase):
@@ -736,6 +835,115 @@ class Start(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--port") + 1], "8099")
         self.assertEqual(info["context"], "65536")
         self.assertNotIn("--expert-profile", json.loads(p.read_text())["args"])   # (GLM's profile is not DeepSeek's)
+
+
+class StartingProfile(unittest.TestCase):
+    """DeepSeek's shipped expert profile: copied into a pack that has none (maya.ds4_seed_profile), and how
+    tools/ds4/profile.py makes it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.pack = self.root / "maya-ds4"
+        self.pack.mkdir()
+        (self.pack / "ds4.txt").write_text("num_hidden_layers 2\nn_routed_experts 4\nnum_experts_per_tok 2\n")
+        self.shipped = self.root / "expert-profile-ds4.bin"
+        self.shipped.write_bytes(bytes(range(32)))
+        self.p = patch.object(maya, "DS4_PROFILE", self.shipped)
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+        self.tmp.cleanup()
+
+    def cfg(self, *extra):
+        return {"args": ["--pack", str(self.pack), "--max-context", "65536", *extra]}
+
+    def test_seeds_a_pack_without_one(self):
+        self.assertEqual(maya.ds4_seed_profile(self.cfg()), self.pack / "expert-profile.bin")
+        self.assertEqual((self.pack / "expert-profile.bin").read_bytes(), bytes(range(32)))
+
+    def test_leaves_a_learned_one_and_an_explicit_one(self):
+        (self.pack / "expert-profile.bin").write_bytes(b"\1" * 32)
+        self.assertIsNone(maya.ds4_seed_profile(self.cfg()))           # (what this PC learned stays)
+        self.assertEqual((self.pack / "expert-profile.bin").read_bytes(), b"\1" * 32)
+        (self.pack / "expert-profile.bin").unlink()
+        self.assertIsNone(maya.ds4_seed_profile(self.cfg("--expert-profile", "none")))
+        self.assertFalse((self.pack / "expert-profile.bin").exists())
+
+    def test_only_the_packs_geometry(self):
+        self.shipped.write_bytes(bytes(40))
+        self.assertIsNone(maya.ds4_seed_profile(self.cfg()))
+        self.assertFalse((self.pack / "expert-profile.bin").exists())
+
+    def test_make_and_compare(self):
+        import importlib
+        prof = importlib.import_module("ds4.profile")
+        a = [[10, 0, 30, 60], [1, 1, 1, 1]]
+        b = [[1, 0, 3, 6], [0, 0, 0, 4]]
+        out = prof.make([a, b], 2, 4, 2, tokens=100)
+        self.assertEqual(out[0], [20, 0, 60, 120])                     # (equal weights: the same shares; k x tokens)
+        self.assertEqual(sum(out[1]), 200)
+        self.assertEqual(out[1].index(max(out[1])), 3)
+        self.assertEqual(prof.agree(a, b, 2), [1.0, 0.5])
+
+
+class Drafting(unittest.TestCase):
+    """The drafter chosen by the user instead of the speed calibration: --drafting, the question, and the config."""
+    def setUp(self):
+        self.quiet = [patch.object(maya, n, lambda *a, **k: None) for n in ("say", "ok")]
+        for p in self.quiet:
+            p.start()
+        self.dir = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        for p in self.quiet:
+            p.stop()
+
+    def test_choice(self):
+        choice = lambda **kw: maya.drafting_choice(args(**kw), "The DSpark drafter", "10-30")   # noqa: E731
+        self.assertEqual(choice(drafting="off"), "off")
+        self.assertEqual(choice(drafting="on", no_speed_calibration=False), "on")
+        self.assertEqual(choice(no_speed_calibration=True), "on")
+        self.assertEqual(choice(), "measure")                             # (--yes: measured)
+        for answer, how in (("m", "measure"), ("y", "on"), ("n", "off")):
+            with patch.object(maya, "ask", return_value=answer) as asked:
+                self.assertEqual(choice(yes=False), how)
+            self.assertEqual(asked.call_args[0][2], "m")                  # (measuring is the default answer)
+
+    def write(self, cfg: dict) -> Path:
+        p = self.dir / "c.json"
+        p.write_text(json.dumps(cfg), encoding="utf-8")
+        return p
+
+    def test_deepseek_kept_as_chosen(self):
+        pack = self.dir / "maya-ds4"
+        pack.mkdir()
+        (pack / "tensors.txt").write_text("t mtp.0.attn.wq_a.weight BF16 0 0 2 1\n")
+        for on, mode in ((True, "on"), (False, "none")):
+            p = self.write({"exe": "/m/build/maya-ds4", "args": ["--pack", str(pack), "--dspark", "none"],
+                            "installer": {"family": "deepseek"}})
+            self.assertTrue(maya.needs_speed_calibration(json.loads(p.read_text())))
+            maya.keep_drafting(p, on)
+            c = json.loads(p.read_text())
+            self.assertEqual(c["args"][-2:], ["--dspark", mode])
+            self.assertEqual(c["args"].count("--dspark"), 1)
+            self.assertEqual(c["installer"]["speed_calibration"]["kept"], "dspark" if on else "none")
+            self.assertFalse(maya.needs_speed_calibration(c))             # (a start does not measure by itself)
+
+    def test_glm_kept_as_chosen(self):
+        cfg = {"exe": "/m/build/maya", "args": ["--glm-pack", "/m/pack", "--dflash", "/m/d.bin"], "gpu": [0, 1]}
+        p = self.write(cfg)
+        maya.keep_drafting(p, False)
+        c = json.loads(p.read_text())
+        self.assertNotIn("--dflash", c["args"])
+        self.assertEqual((c["installer"]["draft"], c["installer"]["speed_calibration"]["kept"]), ("mtp", "mtp"))
+        p = self.write(cfg)
+        maya.keep_drafting(p, True)
+        c = json.loads(p.read_text())
+        self.assertEqual(c["args"][-2:], ["--dflash", "/m/d.bin"])
+        self.assertEqual(c["installer"]["draft"], "dflash2")
+        self.assertFalse(maya.needs_speed_calibration(c))
 
 
 if __name__ == "__main__":

@@ -151,6 +151,55 @@ class Dashboard(unittest.TestCase):
         self.assertIn("age", row)                     # (the page fades a row older than 3 s: the prompt has ended)
 
 
+class Port(unittest.TestCase):
+    """The dashboard's Port: saved into the config and Maya's start script for it; a busy, a reserved or the same port is
+    refused with nothing saved; only Maya's own page may move the server.  (No restart here: maya.py did not start this
+    server, so the port applies from the next start - the restart itself is maya.py's RESTART_EXIT, tested there.)"""
+
+    def setUp(self):
+        os.environ.pop("MAYA_RESTART_ON_UPDATE", None)
+        Dashboard.setUp(self)
+        self.script = Path(self.tmp.name) / "run-maya-test.bat"
+        self.script.write_bytes(b"@echo off\r\npython maya.py --config " + str(self.cfg).encode() + b" --port 8080 %*\r\n")
+
+    tearDown = Dashboard.tearDown
+    req = Dashboard.req
+
+    @staticmethod
+    def free_port():
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def test_saved_and_reported(self):
+        s, _, b = self.req("GET", "/api/port")
+        info = json.loads(b)
+        self.assertEqual((s, info["port"], info["restarts"]), (200, self.httpd.server_address[1], False))
+        n = self.free_port()
+        s, _, b = self.req("POST", "/api/port", {"port": n})
+        self.assertEqual((s, json.loads(b)), (202, {"port": n, "restarts": False}))
+        self.assertEqual(json.loads(self.cfg.read_text())["port"], n)
+        self.assertEqual(json.loads(self.cfg.read_text())["args"][-1], "32768")   # (the rest kept)
+        self.assertIn(f"--port {n} %*\r\n".encode(), self.script.read_bytes())   # (CR LF kept)
+
+    def test_refused_with_nothing_saved(self):
+        import socket
+        busy = socket.socket()
+        busy.bind(("127.0.0.1", 0))
+        busy.listen(1)
+        try:
+            for port in (busy.getsockname()[1], 80, self.httpd.server_address[1], "x"):
+                s, _, b = self.req("POST", "/api/port", {"port": port})
+                self.assertEqual(s, 400, port)
+        finally:
+            busy.close()
+        s, _, _ = self.req("POST", "/api/port", {"port": self.free_port()}, {"Origin": "http://elsewhere.example"})
+        self.assertEqual(s, 403)
+        self.assertNotIn("port", json.loads(self.cfg.read_text()))
+        self.assertIn(b"--port 8080 %*", self.script.read_bytes())
+
+
 class ContextCost(unittest.TestCase):
     """The GLM engine's start lines give what its context costs in VRAM, summed over its GPUs."""
 
@@ -239,10 +288,34 @@ class GpuMap(unittest.TestCase):
         self.assertEqual((g["parts"]["pool"], g["parts"]["vision"]), (r["pool"] - r["tail"], enc))
         self.assertEqual(g["parts"]["other"], 0)
 
+    def test_a_vision_tower_in_the_engines_process(self):
+        # (strata-ds4: the tower on the first GPU inside the engine - vision_own, not a pool tail lent to another process)
+        r = dict(self.r, vision_own=318 * 2**20)
+        engine = sum(r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
+        own = engine + r["vision_own"] + 400 * 2**20
+        (g,) = self.gm.view([r], [self.card(own, {100: own})], engine_pid=100)
+        self.assertEqual((g["parts"]["vision"], g["vision_own"]), (r["vision_own"], r["vision_own"]))
+        self.assertEqual((g["parts"]["rest"], g["parts"]["other"]), (400 * 2**20, 0))   # the CUDA context, not vision
+        (s,) = self.gm.view([r], [], engine_pid=100)             # (no NVML: the start's measurement)
+        self.assertEqual(s["parts"]["vision"], r["vision_own"])
+        self.assertEqual(sum(s["parts"].values()) + s["free"], s["total"])
+
     def test_never_more_than_the_card(self):
         (g,) = self.gm.view([self.r], [self.card(26 * GB, {100: 25 * GB, 200: 2 * GB})], engine_pid=100)
         self.assertLessEqual(sum(g["parts"].values()), g["total"])
         self.assertEqual(g["free"], 0)
+
+    def test_strata_ds4s_prompt_buffers_and_tensor_parallel(self):
+        # (strata-ds4 at --tp 8: a 5060 Ti of the group of 8 - its prompt chunks' buffers and tensor parallel's copies
+        # told apart, the GLM engine's lines without them)
+        r = self.gm.parse("VRAM dev=3 pci=0000:05:00.0 total=16610951168 free=301989888 weights=268435456 kv=33554432 "
+                          "kv_ram=0 act=134217728 drafter=0 window=0 pool=13421772800 tail=0 borrow=0 vision=0 "
+                          "vision_own=0 prompt=1610612736 tp=805306368 tp_n=8 slots=3343 ctx=262144 layers=3-39")
+        (g,) = self.gm.view([r], [], engine_pid=100)
+        self.assertEqual((g["parts"]["prompt"], g["parts"]["tp"], g["tp_n"]), (1610612736, 805306368, 8))
+        self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
+        (h,) = self.gm.view([self.r], [], engine_pid=100)
+        self.assertEqual((h["parts"]["prompt"], h["parts"]["tp"], h["tp_n"]), (0, 0, 0))
 
     def test_two_parts_on_one_card_add_up(self):
         a = dict(self.r, layers=[0, 20], slots=500)
