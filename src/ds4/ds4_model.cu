@@ -4007,8 +4007,12 @@ struct Model::Impl {
         const int cols = std::max(128, (int) std::min<size_t>((size_t) m.n, c.w16_elems / (size_t) m.k) / 128 * 128);
         for (int c0 = 0; c0 < m.n; c0 += cols) {
             const int nc = std::min(cols, m.n - c0);
-            if (m.fmt != 0) gg::rows(nc == m.n ? m : gg::view(m, c0, nc), c.w16, false, d.st);   // (a GGUF's)
-            else x3::reconstruct_rows(nc == m.n ? m : x3::view(m, c0, nc), c.w16, false, d.st);
+            if (m.fmt != 0) {   // (a GGUF's)
+                if (!gg::rows(nc == m.n ? m : gg::view(m, c0, nc), c.w16, false, d.st)) {
+                    err = "gg::rows: the reconstruction did not launch";
+                    return false;
+                }
+            } else x3::reconstruct_rows(nc == m.n ? m : x3::view(m, c0, nc), c.w16, false, d.st);
             if (beta == 0.0f && lt::gemm(d.st, c.w16, nc, m.k, x16, ldx, rows, y + c0, ldy)) continue;   // (AMD)
             const float one = 1.0f;
             const cublasStatus_t st = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, m.k, &one, c.w16, CUDA_R_16F,
@@ -4767,9 +4771,9 @@ struct Model::Impl {
                     }
 #endif
                     if (!done) {
-                        gg::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st);
+                        if (!gg::set_gate_up(sa, c.x, D, c.row_tok + a, c.h16, FF, d.st)) return false;
                         if (!rp_set_sync("set_gate_up")) return false;
-                        gg::set_down(sa, c.h16, FF, c.y, D, d.st);
+                        if (!gg::set_down(sa, c.h16, FF, c.y, D, d.st)) return false;
                         if (!rp_set_sync("set_down")) return false;
                     }
                 } else {
@@ -8996,10 +9000,14 @@ struct Model::Impl {
         std::vector<double> t;
         for (int k = 0; k < 12; ++k) {
             cudaEventRecord(e0, d.st);
-            gg::moe_gate_up(ma, b.x, b.h, d.st);
-            gg::moe_down(ma, b.h, b.sh, b.out, d.st);
+            const bool ok = gg::moe_gate_up(ma, b.x, b.h, d.st) && gg::moe_down(ma, b.h, b.sh, b.out, d.st);
             cudaEventRecord(e1, d.st);
             cudaEventSynchronize(e1);
+            if (!ok) {   // (a failed launch: the timing would be of nothing)
+                cudaEventDestroy(e0);
+                cudaEventDestroy(e1);
+                return -1.0;
+            }
             float ms = 0.0f;
             cudaEventElapsedTime(&ms, e0, e1);
             if (k >= 3) t.push_back(ms);
@@ -9327,8 +9335,10 @@ struct Model::Impl {
             ma.n_embd = E;
             ma.n_ff = g.ff;
             ma.limit = g.lim;
-            gg::moe_gate_up(ma, b.x, b.h, d.st);
-            gg::moe_down(ma, b.h, b.sh, b.out, d.st);
+            if (!gg::moe_gate_up(ma, b.x, b.h, d.st) || !gg::moe_down(ma, b.h, b.sh, b.out, d.st)) {
+                ++n_bad;
+                continue;
+            }
             std::vector<float> yg((size_t) E);
             cudaMemcpyAsync(yg.data(), b.out, (size_t) E * 4, cudaMemcpyDeviceToHost, d.st);
             cudaStreamSynchronize(d.st);
@@ -13979,8 +13989,12 @@ struct Model::Impl {
                 ma.limit = g.lim;
                 const bool mx = lay.fmt == gg::kFmtMXFP4;
                 moe_path = 1;
-                if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
-                else x3::moe_gate_up(ma, d.x, d.xg, s);
+                if (mx) {
+                    if (!gg::moe_gate_up(ma, d.x, d.xg, s)) {
+                        err = "moe_gate_up: the launch failed";
+                        return false;
+                    }
+                } else x3::moe_gate_up(ma, d.x, d.xg, s);
                 prof_mark(d, 3);
                 // the PCIe lane (a layer that streams): the experts the host reads for it pulled into this GPU's slots as
                 // they land, into the plan, their gate / up - all while the CPU lane computes - their down with the VRAM
@@ -13994,12 +14008,19 @@ struct Model::Impl {
                                        d.plan_ptr, LD.plan2, l.k_exp, LD.blocks, s);
                     x3::MoeArgs m2 = ma;
                     m2.plan_ptr = LD.plan2;
-                    gg::moe_gate_up(m2, d.x, d.xg, s);
+                    if (!gg::moe_gate_up(m2, d.x, d.xg, s)) {
+                        err = "moe_gate_up (the streamed experts): the launch failed";
+                        return false;
+                    }
                 }
                 if (lead) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
-                if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
-                else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                if (mx) {
+                    if (!gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s)) {
+                        err = "moe_down: the launch failed";
+                        return false;
+                    }
+                } else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
             } else {   // each distinct expert read once for the window's tokens
                 moe_path = 2;
                 gf::MoeWin mw;

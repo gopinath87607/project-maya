@@ -22,12 +22,14 @@ namespace {
 
 std::atomic<int> g_errors{0};
 
-void check(const char* what) {
+bool check(const char* what) {   // (the caller reports; a failed launch must not leave its stale output behind as if it were this one's)
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "ds4 gguf %s: %s\n", what, cudaGetErrorString(e));
         g_errors.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
+    return true;
 }
 void fail(const char* what) {
     std::fprintf(stderr, "ds4 gguf %s\n", what);
@@ -1213,21 +1215,20 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
         fail("mv: a low-bit job not covered");
         return false;
     }
-    check("mv");
-    return true;
+    return check("mv");
 }
 
-void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
+bool rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
     if ((m.fmt != kFmtBF16 && m.fmt != kFmtQ8_0) || m.raw == nullptr) {
         fail("rows: not a BF16 or Q8_0 matrix");
-        return;
+        return false;
     }
     const size_t ld = row_stride(m);
     const size_t total = (size_t) m.n * (size_t) m.k;
     const unsigned blocks = (unsigned) std::min<size_t>((total + 255) / 256, 65535);
     if (m.fmt == kFmtQ8_0) q8_rows_kernel<<<blocks, 256, 0, s>>>((const uint8_t*) m.raw, ld, m.k, m.n, dst, bf16);
     else bf16_rows_kernel<<<blocks, 256, 0, s>>>((const uint16_t*) m.raw, ld, m.k, m.n, dst, bf16);
-    check("rows");
+    return check("rows");
 }
 
 namespace {
@@ -1269,21 +1270,20 @@ void act_q8k(const float* x, int rows, int k, int8_t* q, float* d, cudaStream_t 
     check("act_q8k");
 }
 
-void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s) {
-    if (!mx_geometry("moe_gate_up", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
+bool moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s) {
+    if (!mx_geometry("moe_gate_up", a.k, a.n_embd, a.n_ff) || h == nullptr) return false;
     Scratch* sc = scratch(s);
-    if (sc == nullptr) return;
+    if (sc == nullptr) return false;
     if (!mx_experts(a.lay)) {   // low-bit experts: ds4_iq's kernels
         iq::Args ia;
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_gate_up")) return;
+        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_gate_up")) return false;
         ia.plan_ptr = a.plan_ptr;
         ia.h = h;
         ia.xq = sc->xq;
         ia.xd = sc->xd;
         iq_act_quant(x, (size_t) a.n_embd, 1, a.n_embd, sc->xq, sc->xd, s);
         iq::gate_up(ia, a.k, 1, s);
-        check("moe_gate_up");
-        return;
+        return check("moe_gate_up");
     }
     MxArgs m = mx_args(a.lay, a.n_embd, a.n_ff, a.limit);
     m.plan_ptr = a.plan_ptr;
@@ -1293,13 +1293,13 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
     m.xd = sc->xd;
     q8_quant(x, (size_t) a.n_embd, 1, a.n_embd, sc->xq, sc->xd, s);
     launch_groups<GateUpK>(m, a.n_ff, a.k, 1, s);
-    check("moe_gate_up");
+    return check("moe_gate_up");
 }
 
-void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
-    if (!mx_geometry("moe_down", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
+bool moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
+    if (!mx_geometry("moe_down", a.k, a.n_embd, a.n_ff) || h == nullptr) return false;
     Scratch* sc = scratch(s);
-    if (sc == nullptr) return;
+    if (sc == nullptr) return false;
     MxArgs m = mx_args(a.lay, a.n_embd, a.n_ff, a.limit);
     m.plan_ptr = a.plan_ptr;
     m.h = const_cast<float*>(h);
@@ -1309,7 +1309,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     (mx_experts(a.lay) ? q8_quant : iq_act_quant)(h, (size_t) a.n_ff, a.k, a.n_ff, sc->hq, sc->hd, s);
     if (!mx_experts(a.lay)) {   // low-bit experts: ds4_iq's down, then the same combine
         iq::Args ia;
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down")) return;
+        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down")) return false;
         ia.plan_ptr = a.plan_ptr;
         ia.part = sc->part;
         ia.hq = sc->hq;
@@ -1331,7 +1331,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     c.k = a.k;
     c.n_embd = a.n_embd;
     mx_combine_kernel<<<dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, s>>>(c);
-    check("moe_down");
+    return check("moe_down");
 }
 
 bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
@@ -1392,8 +1392,7 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     c.k = a.k;
     c.n_embd = a.n_embd;
     mx_combine_kernel<<<dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, s>>>(c);
-    check("win_experts");
-    return true;
+    return check("win_experts");
 }
 
 namespace {
@@ -1413,13 +1412,13 @@ iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (th
 }
 }  // namespace
 
-void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
+bool set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
                  cudaStream_t s, const uint16_t* x16) {
-    if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
-    if (!mx_geometry("set_gate_up", 1, sa.n_embd, sa.n_ff)) return;
+    if (sa.n_exp <= 0 || sa.max_rows <= 0) return true;   // (no experts: nothing to do)
+    if (!mx_geometry("set_gate_up", 1, sa.n_embd, sa.n_ff)) return false;
     if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
         iq::Args ia;
-        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up")) return;
+        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up")) return false;
         iq::SetArgs q = iq_set(sa);
         q.xf = x;
         q.xh = x16;   // (the tensor-core tiles' FP16 rows; the light kernels keep xf)
@@ -1430,8 +1429,7 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
         q.tg = ia.tg;
         q.td = ia.td;
         if (!iq::set_gate_up(q, s)) fail("set_gate_up: not covered");
-        check("set_gate_up");
-        return;
+        return check("set_gate_up");
     }
     int skip = 0;
     {   // the experts of at most 16 rows: the light kernels (each weight read once; ds4_iq.cuh), the others the tiles
@@ -1443,10 +1441,7 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
         q.ldo = ldh;
         q.tg = q.td = kTypeMXFP4;
         if (iq::light_gate_up(q, s)) {
-            if (sa.max_rows <= 16) {
-                check("set_gate_up");
-                return;
-            }
+            if (sa.max_rows <= 16) return check("set_gate_up");
             skip = 16;
         }
     }
@@ -1475,15 +1470,15 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
 #endif
     else
         mx_set_kernel<true><<<grid, kThreads, 0, s>>>(k);
-    check("set_gate_up");
+    return check("set_gate_up");
 }
 
-void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s) {
-    if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
-    if (!mx_geometry("set_down", 1, sa.n_embd, sa.n_ff)) return;
+bool set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s) {
+    if (sa.n_exp <= 0 || sa.max_rows <= 0) return true;   // (no experts: nothing to do)
+    if (!mx_geometry("set_down", 1, sa.n_embd, sa.n_ff)) return false;
     if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
         iq::Args ia;
-        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_down")) return;
+        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_down")) return false;
         iq::SetArgs q = iq_set(sa);
         q.xh = h16;
         q.ldx = ldh;
@@ -1492,8 +1487,7 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
         q.tg = ia.tg;
         q.td = ia.td;
         if (!iq::set_down(q, s)) fail("set_down: not covered");
-        check("set_down");
-        return;
+        return check("set_down");
     }
     int skip = 0;
     {   // (as set_gate_up's)
@@ -1504,10 +1498,7 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
         q.ldo = ldy;
         q.tg = q.td = kTypeMXFP4;
         if (iq::light_down(q, s)) {
-            if (sa.max_rows <= 16) {
-                check("set_down");
-                return;
-            }
+            if (sa.max_rows <= 16) return check("set_down");
             skip = 16;
         }
     }
@@ -1533,7 +1524,7 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
 #endif
     else
         mx_set_kernel<false><<<grid, kThreads, 0, s>>>(k);
-    check("set_down");
+    return check("set_down");
 }
 
 }  // namespace strata::ds4::gguf

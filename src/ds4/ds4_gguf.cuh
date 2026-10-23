@@ -60,16 +60,17 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s);
 x3::Mat view(const x3::Mat& m, int c0, int nc);
 /// x3::reconstruct_rows' layout from a BF16 or Q8_0 matrix: dst[r][c] = W[c][r] (n rows of k values), F16 or BF16
 /// bits (a Q8_0 weight rounded to them).
-void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
+bool rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
 
 /// x3::moe_gate_up / moe_down / win_experts / set_gate_up / set_down for a GGUF's experts (lay.fmt == kFmtMXFP4; the
-/// roles' types in lay.gg_type, see expert_type).
-void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s);
-void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
+/// roles' types in lay.gg_type, see expert_type).  Each returns false when its launch failed: the output is then not
+/// this call's (the caller must not use it), unlike a successful enqueue, which may still be running.
+bool moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s);
+bool moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
 bool win_experts(const x3::WinArgs& a, cudaStream_t s);
-void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
+bool set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
                  cudaStream_t s, const uint16_t* x16 = nullptr);   // (x16: x's rows_f16, ldx apart - the low-bit tiles read it)
-void set_down(const x3::SetArgs& a, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s);
+bool set_down(const x3::SetArgs& a, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s);
 
 /// (tests) rows of k values (k % 256 == 0, rows k apart) rounded as the CPU lane rounds a low-bit expert's activations
 /// (ggml's Q8_K): q[r][k] int8 and d[r][k / 32] (each 256's scale in its eight 32-blocks) - what the low-bit experts'
